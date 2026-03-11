@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.pt
+*.bin
+.DS_Store
+outputs/
+lora_math_explainer.html
