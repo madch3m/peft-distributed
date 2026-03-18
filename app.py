@@ -29,6 +29,11 @@ CONFIG = {
     "node_secret": os.environ.get("NODE_SECRET", "local_test_secret"),
     "hf_token": os.environ.get("HF_TOKEN", ""),
     "model_repo_id": os.environ.get("MODEL_REPO_ID", ""),
+    "node_labels": {
+        "node_a": "Node A (Layers 0–10)",
+        "node_b": "Node B (Layers 11–21)",
+        "node_c": "Node C (Layers 22–31)",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -40,11 +45,22 @@ state = {
     "submitted_nodes": [],
     "history": [],
     "last_update": None,
+    "node_metrics": {},       # {node_id: {loss, step, timestamp, ...}}
+    "activity_log": [],       # recent events for the activity feed
 }
 
 
 def _timestamp() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _log_activity(message: str):
+    """Append a timestamped entry to the activity log (keep last 50)."""
+    state["activity_log"].append({
+        "time": _timestamp(),
+        "message": message,
+    })
+    state["activity_log"] = state["activity_log"][-50:]
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +139,8 @@ class SubmitRequest(BaseModel):
     node_id: str
     secret_key: str
     round_num: int | None = None
+    avg_loss: float | None = None
+    steps_completed: int | None = None
 
 
 class ResetRequest(BaseModel):
@@ -165,15 +183,37 @@ def submit_node(req: SubmitRequest):
     state["submitted_nodes"].append(req.node_id)
     state["last_update"] = _timestamp()
 
+    # Store node metrics
+    state["node_metrics"][req.node_id] = {
+        "avg_loss": req.avg_loss,
+        "steps_completed": req.steps_completed,
+        "round": state["current_round"],
+        "submitted_at": _timestamp(),
+    }
+
+    # Log activity
+    _log_activity(f"{req.node_id} submitted round {state['current_round']}"
+                  + (f" (loss: {req.avg_loss:.4f})" if req.avg_loss else ""))
+
     # Check if all nodes have submitted
     if set(state["submitted_nodes"]) == set(CONFIG["expected_nodes"]):
+        _log_activity(f"All nodes submitted — starting FedAvg for round {state['current_round']}")
         merge_result = fedavg_merge()
+
+        # Capture per-node losses in history
+        round_metrics = {
+            nid: state["node_metrics"].get(nid, {}).get("avg_loss")
+            for nid in CONFIG["expected_nodes"]
+        }
 
         state["history"].append({
             "round": state["current_round"],
             "completed_at": _timestamp(),
             "merge_result": merge_result,
+            "node_losses": round_metrics,
         })
+
+        _log_activity(f"Round {state['current_round']} FedAvg complete")
 
         state["current_round"] += 1
         state["submitted_nodes"] = []
@@ -204,6 +244,10 @@ def reset_state(req: ResetRequest):
     state["submitted_nodes"] = []
     state["history"] = []
     state["last_update"] = _timestamp()
+    state["node_metrics"] = {}
+    state["activity_log"] = []
+
+    _log_activity("State reset to round 1")
 
     return {"status": "reset", "current_round": 1}
 
@@ -212,35 +256,152 @@ def reset_state(req: ResetRequest):
 # Gradio dashboard
 # ---------------------------------------------------------------------------
 
-def dashboard_status():
-    remaining = [
-        n for n in CONFIG["expected_nodes"]
-        if n not in state["submitted_nodes"]
-    ]
-    lines = [
-        f"## Round {state['current_round']}",
-        "",
-        f"**Submitted:** {', '.join(state['submitted_nodes']) or 'none'}",
-        f"**Remaining:** {', '.join(remaining) or 'none'}",
-        f"**Last update:** {state['last_update'] or 'N/A'}",
-        "",
-        "### History",
-    ]
-    if state["history"]:
-        for h in state["history"][-5:]:
-            lines.append(
-                f"- Round {h['round']} completed at {h['completed_at']}"
-            )
-    else:
-        lines.append("_No completed rounds yet._")
+def _round_progress_md():
+    """Round progress bar and summary."""
+    total = len(CONFIG["expected_nodes"])
+    done = len(state["submitted_nodes"])
+    pct = int((done / total) * 100) if total else 0
+    bar = "█" * done + "░" * (total - done)
+
+    return (
+        f"## Round {state['current_round']}\n\n"
+        f"**Progress:** {bar}  {done}/{total} nodes ({pct}%)\n\n"
+        f"**Last update:** {state['last_update'] or 'Waiting for first submission'}"
+    )
+
+
+def _node_cards_md():
+    """Visual status card for each node."""
+    lines = []
+    for node_id in CONFIG["expected_nodes"]:
+        label = CONFIG["node_labels"].get(node_id, node_id)
+        metrics = state["node_metrics"].get(node_id, {})
+
+        if node_id in state["submitted_nodes"]:
+            icon = "✅"
+            status_text = "Submitted"
+        else:
+            icon = "⏳"
+            status_text = "Waiting"
+
+        lines.append(f"### {icon} {label}")
+        lines.append(f"**Status:** {status_text}")
+
+        if metrics.get("avg_loss") is not None:
+            lines.append(f"**Avg Loss:** {metrics['avg_loss']:.4f}")
+        if metrics.get("steps_completed") is not None:
+            lines.append(f"**Steps:** {metrics['steps_completed']}")
+        if metrics.get("submitted_at"):
+            lines.append(f"**Submitted:** {metrics['submitted_at']}")
+
+        lines.append("")
 
     return "\n".join(lines)
 
 
-with gr.Blocks(title="PEFT Aggregator") as demo:
+def _loss_history_md():
+    """Per-round loss table and trend."""
+    if not state["history"]:
+        return "### Training Metrics\n\n_No completed rounds yet._"
+
+    lines = ["### Training Metrics\n"]
+    lines.append("| Round | " + " | ".join(
+        CONFIG["node_labels"].get(n, n).split(" ")[0] + " " + CONFIG["node_labels"].get(n, n).split(" ")[1]
+        for n in CONFIG["expected_nodes"]
+    ) + " | Avg |")
+    lines.append("|---|" + "---|" * (len(CONFIG["expected_nodes"]) + 1))
+
+    for h in state["history"]:
+        node_losses = h.get("node_losses", {})
+        values = []
+        valid_losses = []
+        for n in CONFIG["expected_nodes"]:
+            loss = node_losses.get(n)
+            if loss is not None:
+                values.append(f"{loss:.4f}")
+                valid_losses.append(loss)
+            else:
+                values.append("—")
+
+        avg = f"{np.mean(valid_losses):.4f}" if valid_losses else "—"
+        lines.append(f"| {h['round']} | " + " | ".join(values) + f" | {avg} |")
+
+    # Trend indicator
+    if len(state["history"]) >= 2:
+        recent = state["history"][-2:]
+        losses = []
+        for h in recent:
+            node_losses = h.get("node_losses", {})
+            vals = [v for v in node_losses.values() if v is not None]
+            if vals:
+                losses.append(np.mean(vals))
+        if len(losses) == 2:
+            if losses[1] < losses[0]:
+                lines.append(f"\n**Trend:** Loss decreasing ↓")
+            else:
+                lines.append(f"\n**Trend:** Loss increasing ↑")
+
+    return "\n".join(lines)
+
+
+def _merged_adapters_md():
+    """Links to merged adapter files on HF Hub."""
+    repo = CONFIG["model_repo_id"]
+    if not state["history"]:
+        return "### Merged Adapters\n\n_No merges yet._"
+
+    lines = ["### Merged Adapters\n"]
+    for h in state["history"]:
+        rnd = h["round"]
+        url = f"https://huggingface.co/{repo}/blob/main/merged/round_{rnd}/adapter_model.safetensors"
+        lines.append(f"- **Round {rnd}:** [{h.get('merge_result', 'View')}]({url})")
+
+    return "\n".join(lines)
+
+
+def _activity_log_md():
+    """Recent activity feed."""
+    if not state["activity_log"]:
+        return "### Activity Log\n\n_No activity yet._"
+
+    lines = ["### Activity Log\n"]
+    for entry in reversed(state["activity_log"][-15:]):
+        t = entry["time"].split("T")[1].split(".")[0] if "T" in entry["time"] else entry["time"]
+        lines.append(f"- `{t}` {entry['message']}")
+
+    return "\n".join(lines)
+
+
+# --- Build the Gradio UI ---
+
+with gr.Blocks(title="PEFT Aggregator", theme=gr.themes.Soft()) as demo:
     gr.Markdown("# Distributed PEFT Fine-Tuning — Aggregator Dashboard")
-    status_display = gr.Markdown(dashboard_status)
-    refresh_btn = gr.Button("Refresh")
-    refresh_btn.click(fn=dashboard_status, outputs=status_display)
+
+    with gr.Row():
+        progress_display = gr.Markdown(_round_progress_md)
+
+    with gr.Row():
+        with gr.Column(scale=2):
+            node_cards = gr.Markdown(_node_cards_md)
+        with gr.Column(scale=3):
+            loss_display = gr.Markdown(_loss_history_md)
+
+    with gr.Row():
+        with gr.Column():
+            adapters_display = gr.Markdown(_merged_adapters_md)
+        with gr.Column():
+            activity_display = gr.Markdown(_activity_log_md)
+
+    refresh_btn = gr.Button("🔄 Refresh Dashboard", variant="primary")
+    refresh_btn.click(
+        fn=lambda: (
+            _round_progress_md(),
+            _node_cards_md(),
+            _loss_history_md(),
+            _merged_adapters_md(),
+            _activity_log_md(),
+        ),
+        outputs=[progress_display, node_cards, loss_display, adapters_display, activity_display],
+    )
 
 app = gr.mount_gradio_app(app, demo, path="/")
