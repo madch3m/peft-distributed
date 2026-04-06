@@ -24,7 +24,9 @@ def client(monkeypatch):
     import app as app_module
 
     importlib.reload(app_module)
-    app_module._submit_rate_buckets.clear()
+    rb = getattr(app_module, "_submit_rate_buckets", None)
+    if rb is not None:
+        rb.clear()
 
     # Hard reset in-memory state (reload re-executes module but keeps clarity)
     app_module.state["current_round"] = 1
@@ -67,7 +69,9 @@ def test_submit_rate_limit(client, monkeypatch):
     import app as app_module
 
     importlib.reload(app_module)
-    app_module._submit_rate_buckets.clear()
+    rb = getattr(app_module, "_submit_rate_buckets", None)
+    if rb is not None:
+        rb.clear()
     app_module.state["current_round"] = 1
     app_module.state["submitted_nodes"] = []
     app_module.state["node_metrics"] = {}
