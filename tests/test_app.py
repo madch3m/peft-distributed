@@ -92,6 +92,49 @@ def test_submit_invalid_secret(client):
     assert r.status_code == 401
 
 
+def test_submit_round_num_mismatch(client):
+    tc, m = client
+    secret = m.CONFIG["node_secret"]
+    r = tc.post(
+        "/submit",
+        json={
+            "node_id": "node_a",
+            "secret_key": secret,
+            "round_num": 99,
+        },
+    )
+    assert r.status_code == 409
+    assert "current_round" in r.json()["detail"]
+
+
+def test_submit_avg_loss_validation(client):
+    tc, m = client
+    secret = m.CONFIG["node_secret"]
+    r = tc.post(
+        "/submit",
+        json={
+            "node_id": "node_a",
+            "secret_key": secret,
+            "avg_loss": 2.0e7,
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_submit_rejects_unknown_json_fields(client):
+    tc, m = client
+    secret = m.CONFIG["node_secret"]
+    r = tc.post(
+        "/submit",
+        json={
+            "node_id": "node_a",
+            "secret_key": secret,
+            "extra_field": 1,
+        },
+    )
+    assert r.status_code == 422
+
+
 def test_submit_unknown_node(client):
     tc, m = client
     r = tc.post(

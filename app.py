@@ -9,6 +9,7 @@ Gradio dashboard + FastAPI endpoints:
 FedAvg pipeline: when all 3 nodes submit, averages adapter states on HF Hub.
 """
 
+import math
 import os
 import json
 import time
@@ -17,7 +18,7 @@ import datetime
 import gradio as gr
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_validator
 from starlette.responses import JSONResponse
 from huggingface_hub import HfApi, hf_hub_download, upload_file
 from safetensors.torch import load_file, save_file
@@ -211,11 +212,31 @@ def health():
 
 
 class SubmitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     node_id: str
     secret_key: str
     round_num: int | None = None
     avg_loss: float | None = None
     steps_completed: int | None = None
+
+    @field_validator("avg_loss")
+    @classmethod
+    def avg_loss_finite(cls, v: float | None) -> float | None:
+        if v is None:
+            return v
+        if not math.isfinite(v) or abs(v) > 1.0e7:
+            raise ValueError("avg_loss must be finite and |avg_loss| <= 1e7")
+        return v
+
+    @field_validator("steps_completed")
+    @classmethod
+    def steps_in_range(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if v < 0 or v > 10**9:
+            raise ValueError("steps_completed must be between 0 and 1e9 inclusive")
+        return v
 
 
 class ResetRequest(BaseModel):
@@ -246,6 +267,15 @@ def submit_node(req: SubmitRequest):
             status_code=400,
             detail=f"Unknown node_id: {req.node_id}. "
                    f"Expected: {CONFIG['expected_nodes']}",
+        )
+
+    if req.round_num is not None and req.round_num != state["current_round"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"round_num {req.round_num} does not match aggregator "
+                f"current_round {state['current_round']}"
+            ),
         )
 
     if req.node_id in state["submitted_nodes"]:
