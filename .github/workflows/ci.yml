@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  docker-pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build aggregator image
+        run: docker build -t peft-agg-ci .
+
+      - name: Run pytest inside image (matches Space stack)
+        run: |
+          docker run --rm --user root \
+            -v "${{ github.workspace }}/tests:/app/tests" \
+            peft-agg-ci \
+            bash -c "pip install -q pytest && cd /app && python -m pytest tests/ -v --tb=short"
