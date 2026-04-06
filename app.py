@@ -7,6 +7,8 @@ Gradio dashboard + FastAPI endpoints:
     /reset   — Reset to round 1
 
 FedAvg pipeline: when all 3 nodes submit, averages adapter states on HF Hub.
+
+Optional env: ADMIN_SECRET (reset-only), STATUS_READ_SECRET (GET /status via X-Status-Secret).
 """
 
 import logging
@@ -31,6 +33,8 @@ from safetensors.torch import load_file, save_file
 CONFIG = {
     "expected_nodes": ["node_a", "node_b", "node_c"],
     "node_secret": os.environ.get("NODE_SECRET", "local_test_secret"),
+    "admin_secret": os.environ.get("ADMIN_SECRET", "").strip(),
+    "status_read_secret": os.environ.get("STATUS_READ_SECRET", "").strip(),
     "hf_token": os.environ.get("HF_TOKEN", ""),
     "model_repo_id": os.environ.get("MODEL_REPO_ID", ""),
     "rate_limit_submit_max": int(os.environ.get("RATE_LIMIT_SUBMIT_MAX", "120")),
@@ -56,6 +60,14 @@ def _agg_logger() -> logging.Logger:
 
 
 agg_log = _agg_logger()
+
+
+def _effective_reset_secret() -> str:
+    """POST /reset accepts ADMIN_SECRET when set; otherwise NODE_SECRET."""
+    if CONFIG["admin_secret"]:
+        return CONFIG["admin_secret"]
+    return CONFIG["node_secret"]
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -259,7 +271,16 @@ class ResetRequest(BaseModel):
 
 
 @app.get("/status")
-def get_status():
+def get_status(request: Request):
+    sr = CONFIG["status_read_secret"]
+    if sr:
+        hdr = request.headers.get("x-status-secret", "")
+        if hdr != sr:
+            agg_log.warning("status rejected: invalid or missing X-Status-Secret")
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing X-Status-Secret header",
+            )
     return {
         "current_round": state["current_round"],
         "submitted_nodes": state["submitted_nodes"],
@@ -398,7 +419,7 @@ def submit_node(req: SubmitRequest):
 
 @app.post("/reset")
 def reset_state(req: ResetRequest):
-    if req.secret_key != CONFIG["node_secret"]:
+    if req.secret_key != _effective_reset_secret():
         agg_log.warning("reset rejected: invalid secret")
         raise HTTPException(status_code=401, detail="Invalid secret key")
 

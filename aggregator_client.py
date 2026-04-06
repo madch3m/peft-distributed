@@ -6,10 +6,17 @@ Functions:
     poll_for_next_round() — Block until FedAvg is done and next round begins
     check_aggregator()    — Aggregation state (GET /status)
     health_aggregator()   — Liveness (GET /health)
+    reset_aggregator()    — POST /reset (use ADMIN_SECRET when Space has one)
 """
 
 import time
 import requests
+
+
+def _status_headers(status_secret: str | None) -> dict[str, str]:
+    if status_secret:
+        return {"X-Status-Secret": status_secret}
+    return {}
 
 
 class AggregatorMergeFailed(RuntimeError):
@@ -64,6 +71,7 @@ def poll_for_next_round(
     current_round: int,
     poll_interval: int = 30,
     max_wait: int = 1800,
+    status_secret: str | None = None,
 ) -> dict:
     """Block until the aggregator advances past the current round.
 
@@ -72,6 +80,8 @@ def poll_for_next_round(
         current_round: The round we just finished.
         poll_interval: Seconds between status checks.
         max_wait: Maximum seconds to wait before raising TimeoutError.
+        status_secret: If the Space sets STATUS_READ_SECRET, pass it here
+            (sent as X-Status-Secret on GET /status).
 
     Returns:
         Status dict from the aggregator once it advances.
@@ -80,11 +90,12 @@ def poll_for_next_round(
         TimeoutError: If max_wait is exceeded.
     """
     url = f"{aggregator_url.rstrip('/')}/status"
+    headers = _status_headers(status_secret)
     elapsed = 0
 
     while elapsed < max_wait:
         try:
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(url, timeout=15, headers=headers)
             resp.raise_for_status()
             status = resp.json()
             agg_round = status.get("current_round", 0)
@@ -107,10 +118,35 @@ def poll_for_next_round(
     )
 
 
-def check_aggregator(aggregator_url: str, timeout: int = 10) -> dict:
+def check_aggregator(
+    aggregator_url: str,
+    timeout: int = 10,
+    *,
+    status_secret: str | None = None,
+) -> dict:
     """Return aggregation state from GET /status (round, submitted_nodes, …)."""
     url = f"{aggregator_url.rstrip('/')}/status"
-    response = requests.get(url, timeout=timeout)
+    response = requests.get(
+        url,
+        timeout=timeout,
+        headers=_status_headers(status_secret),
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def reset_aggregator(
+    aggregator_url: str,
+    secret_key: str,
+    timeout: int = 30,
+) -> dict:
+    """Reset aggregator to round 1. Use ADMIN_SECRET if the Space defines it, else NODE_SECRET."""
+    url = f"{aggregator_url.rstrip('/')}/reset"
+    response = requests.post(
+        url,
+        json={"secret_key": secret_key},
+        timeout=timeout,
+    )
     response.raise_for_status()
     return response.json()
 

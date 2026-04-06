@@ -186,6 +186,64 @@ def test_reset(client):
     assert m.state["submitted_nodes"] == []
 
 
+def test_reset_requires_admin_when_admin_secret_set(client, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "")
+    monkeypatch.setenv("MODEL_REPO_ID", "")
+    monkeypatch.setenv("NODE_SECRET", "node_only_secret")
+    monkeypatch.setenv("ADMIN_SECRET", "admin_only_secret")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_MAX", "10000")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_WINDOW_SEC", "60")
+
+    import importlib
+
+    import app as app_module
+
+    importlib.reload(app_module)
+    rb = getattr(app_module, "_submit_rate_buckets", None)
+    if rb is not None:
+        rb.clear()
+    app_module.state["current_round"] = 1
+    app_module.state["submitted_nodes"] = []
+    app_module.state["node_metrics"] = {}
+
+    with TestClient(app_module.app) as tc:
+        tc.post(
+            "/submit",
+            json={"node_id": "node_a", "secret_key": "node_only_secret"},
+        )
+        bad = tc.post("/reset", json={"secret_key": "node_only_secret"})
+        assert bad.status_code == 401
+        good = tc.post("/reset", json={"secret_key": "admin_only_secret"})
+        assert good.status_code == 200
+
+
+def test_status_requires_header_when_status_read_secret_set(client, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "")
+    monkeypatch.setenv("MODEL_REPO_ID", "")
+    monkeypatch.setenv("NODE_SECRET", "test_secret_roundtrip")
+    monkeypatch.setenv("STATUS_READ_SECRET", "peek_abcd")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_MAX", "10000")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_WINDOW_SEC", "60")
+
+    import importlib
+
+    import app as app_module
+
+    importlib.reload(app_module)
+    rb = getattr(app_module, "_submit_rate_buckets", None)
+    if rb is not None:
+        rb.clear()
+    app_module.state["current_round"] = 1
+    app_module.state["submitted_nodes"] = []
+
+    with TestClient(app_module.app) as tc:
+        denied = tc.get("/status")
+        assert denied.status_code == 401
+        ok = tc.get("/status", headers={"X-Status-Secret": "peek_abcd"})
+        assert ok.status_code == 200
+        assert ok.json()["current_round"] == 1
+
+
 def test_gradio_markdown_helpers_no_crash(client):
     """Dashboard builders used by Gradio refresh must not raise."""
     tc, m = client

@@ -20,7 +20,7 @@ pinned: false
 | `/health` | GET | Liveness probe (`{"ok": true}`); no Hub I/O |
 | `/submit` | POST | Node submits round completion |
 | `/status` | GET | Current aggregation state (JSON) |
-| `/reset` | POST | Reset to round 1 |
+| `/reset` | POST | Reset to round 1 (see `ADMIN_SECRET` below) |
 
 ## Secrets Required
 
@@ -29,6 +29,8 @@ pinned: false
 | `HF_TOKEN` | HuggingFace write-access token |
 | `MODEL_REPO_ID` | Target model repo (e.g. `your-org/your-model-repo`) |
 | `NODE_SECRET` | Shared secret — must match all Colab nodes |
+| `ADMIN_SECRET` | *(Optional)* If set, `POST /reset` requires this value instead of `NODE_SECRET` |
+| `STATUS_READ_SECRET` | *(Optional)* If set, `GET /status` requires header `X-Status-Secret: <value>` |
 
 ### Where to set each secret
 
@@ -39,6 +41,8 @@ All three secrets must be added to the Space. Go to your Space's **Settings > Re
 - `HF_TOKEN` — Your HuggingFace token with **write** access
 - `MODEL_REPO_ID` — The HF repo where adapter weights are stored (e.g. `your-username/your-model-repo`)
 - `NODE_SECRET` — Any passphrase you choose; every Colab node must use this same value
+- `ADMIN_SECRET` — *(Optional)* Separate passphrase for **`POST /reset` only**. If unset, reset uses `NODE_SECRET`.
+- `STATUS_READ_SECRET` — *(Optional)* If set, clients must send **`X-Status-Secret`** on **`GET /status`**. The Gradio dashboard still works (it reads in-process state, not HTTP `/status`).
 
 These are read as environment variables in `app.py` (`os.environ.get(...)`).
 
@@ -80,7 +84,8 @@ Without these, the app defaults to empty strings (merge is skipped) and `"local_
 ## Operator notes
 
 - **Secrets:** Never commit `HF_TOKEN`, `NODE_SECRET`, or tokens in git remotes. Use Space **Repository secrets** and a local env or credential helper.
-- **Reset:** `POST /reset` with JSON `{"secret_key": "<NODE_SECRET>"}` clears round state to 1 (same secret as nodes).
+- **Reset:** `POST /reset` with JSON `{"secret_key": "<ADMIN_SECRET or NODE_SECRET>"}` clears round state to 1. If `ADMIN_SECRET` is set on the Space, use that; otherwise use `NODE_SECRET`.
+- **Protected status:** When `STATUS_READ_SECRET` is set, pass the same value as header `X-Status-Secret` (see `aggregator_client.check_aggregator` / `poll_for_next_round` argument `status_secret`, and notebook `CONFIG["status_read_secret"]`).
 - **Rate limits:** `POST /submit` is limited per client IP (first `X-Forwarded-For` hop when present). Override with **`RATE_LIMIT_SUBMIT_MAX`** (default 120) and **`RATE_LIMIT_SUBMIT_WINDOW_SEC`** (default 60).
 - **Logs:** Set **`LOG_LEVEL`** (e.g. `DEBUG`, `INFO`, `WARNING`) for the `peft.aggregator` logger on stdout.
 - **Public Space:** `GET /status` is world-readable on a public Space; use a private Space if round visibility matters.
