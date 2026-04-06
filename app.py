@@ -9,6 +9,7 @@ Gradio dashboard + FastAPI endpoints:
 FedAvg pipeline: when all 3 nodes submit, averages adapter states on HF Hub.
 """
 
+import logging
 import math
 import os
 import json
@@ -42,6 +43,19 @@ CONFIG = {
         "node_c": "Node C (Layers 22–31)",
     },
 }
+
+
+def _agg_logger() -> logging.Logger:
+    lg = logging.getLogger("peft.aggregator")
+    if not lg.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("%(levelname)s [peft_agg] %(message)s"))
+        lg.addHandler(h)
+    lg.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+    return lg
+
+
+agg_log = _agg_logger()
 
 # ---------------------------------------------------------------------------
 # State
@@ -198,6 +212,7 @@ async def limit_submit_rate(request: Request, call_next):
         return await call_next(request)
     key = _client_key_for_rate_limit(request)
     if not _submit_rate_allow(key):
+        agg_log.warning("rate_limit exceeded client_key=%s", key[:128])
         return JSONResponse(
             status_code=429,
             content={"detail": "Too many submit requests; try again later."},
@@ -260,9 +275,11 @@ def get_status():
 @app.post("/submit")
 def submit_node(req: SubmitRequest):
     if req.secret_key != CONFIG["node_secret"]:
+        agg_log.warning("submit rejected: invalid secret node_id=%s", req.node_id)
         raise HTTPException(status_code=401, detail="Invalid secret key")
 
     if req.node_id not in CONFIG["expected_nodes"]:
+        agg_log.warning("submit rejected: unknown node_id=%s", req.node_id)
         raise HTTPException(
             status_code=400,
             detail=f"Unknown node_id: {req.node_id}. "
@@ -270,6 +287,12 @@ def submit_node(req: SubmitRequest):
         )
 
     if req.round_num is not None and req.round_num != state["current_round"]:
+        agg_log.warning(
+            "submit rejected: round mismatch node_id=%s sent=%s current=%s",
+            req.node_id,
+            req.round_num,
+            state["current_round"],
+        )
         raise HTTPException(
             status_code=409,
             detail=(
@@ -287,6 +310,13 @@ def submit_node(req: SubmitRequest):
 
     state["submitted_nodes"].append(req.node_id)
     state["last_update"] = _timestamp()
+    agg_log.info(
+        "submit accepted node_id=%s round=%s progress=%s/%s",
+        req.node_id,
+        state["current_round"],
+        len(state["submitted_nodes"]),
+        len(CONFIG["expected_nodes"]),
+    )
 
     # Store node metrics
     state["node_metrics"][req.node_id] = {
@@ -326,6 +356,11 @@ def submit_node(req: SubmitRequest):
             })
 
             _log_activity(f"Round {state['current_round']} FedAvg complete")
+            agg_log.info(
+                "fedavg_complete round=%s new_round=%s",
+                state["current_round"],
+                state["current_round"] + 1,
+            )
 
             state["current_round"] += 1
             state["submitted_nodes"] = []
@@ -336,6 +371,12 @@ def submit_node(req: SubmitRequest):
                 "new_round": state["current_round"],
             }
 
+        tail = merge_result if len(merge_result) <= 400 else merge_result[:400] + "..."
+        agg_log.warning(
+            "fedavg_failed round=%s detail=%s",
+            state["current_round"],
+            tail,
+        )
         _log_activity(f"FedAvg failed (round {state['current_round']}): {merge_result}")
         state["submitted_nodes"] = []
         return {
@@ -358,8 +399,10 @@ def submit_node(req: SubmitRequest):
 @app.post("/reset")
 def reset_state(req: ResetRequest):
     if req.secret_key != CONFIG["node_secret"]:
+        agg_log.warning("reset rejected: invalid secret")
         raise HTTPException(status_code=401, detail="Invalid secret key")
 
+    agg_log.info("state_reset")
     state["current_round"] = 1
     state["submitted_nodes"] = []
     state["history"] = []
