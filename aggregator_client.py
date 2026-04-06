@@ -4,11 +4,21 @@ aggregator_client.py — Node-side helper for communicating with the aggregator 
 Functions:
     notify_aggregator()   — Tell the aggregator this node finished its round
     poll_for_next_round() — Block until FedAvg is done and next round begins
-    check_aggregator()    — Quick health / status check
+    check_aggregator()    — Aggregation state (GET /status)
+    health_aggregator()   — Liveness (GET /health)
 """
 
 import time
 import requests
+
+
+class AggregatorMergeFailed(RuntimeError):
+    """Raised when the Space returns merge_failed (FedAvg or Hub step failed)."""
+
+    def __init__(self, payload: dict):
+        self.payload = payload
+        msg = payload.get("merge_result") or "merge_failed"
+        super().__init__(msg)
 
 
 def notify_aggregator(
@@ -29,6 +39,9 @@ def notify_aggregator(
 
     Returns:
         JSON response from the aggregator.
+
+    Raises:
+        AggregatorMergeFailed: If status is merge_failed (fix Hub files and resubmit).
     """
     payload = {
         "node_id": node_id,
@@ -40,7 +53,10 @@ def notify_aggregator(
     url = f"{aggregator_url.rstrip('/')}/submit"
     response = requests.post(url, json=payload, timeout=timeout)
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+    if data.get("status") == "merge_failed":
+        raise AggregatorMergeFailed(data)
+    return data
 
 
 def poll_for_next_round(
@@ -92,16 +108,16 @@ def poll_for_next_round(
 
 
 def check_aggregator(aggregator_url: str, timeout: int = 10) -> dict:
-    """Quick health check — returns the aggregator status JSON.
-
-    Args:
-        aggregator_url: Base URL of the aggregator Space.
-        timeout: Request timeout in seconds.
-
-    Returns:
-        Status dict with current_round, submitted_nodes, etc.
-    """
+    """Return aggregation state from GET /status (round, submitted_nodes, …)."""
     url = f"{aggregator_url.rstrip('/')}/status"
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def health_aggregator(aggregator_url: str, timeout: int = 10) -> dict:
+    """Liveness probe via GET /health; does not depend on training state."""
+    url = f"{aggregator_url.rstrip('/')}/health"
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
     return response.json()
