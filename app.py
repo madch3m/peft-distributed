@@ -11,12 +11,14 @@ FedAvg pipeline: when all 3 nodes submit, averages adapter states on HF Hub.
 
 import os
 import json
+import time
 import datetime
 
 import gradio as gr
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from starlette.responses import JSONResponse
 from huggingface_hub import HfApi, hf_hub_download, upload_file
 from safetensors.torch import load_file, save_file
 
@@ -29,6 +31,10 @@ CONFIG = {
     "node_secret": os.environ.get("NODE_SECRET", "local_test_secret"),
     "hf_token": os.environ.get("HF_TOKEN", ""),
     "model_repo_id": os.environ.get("MODEL_REPO_ID", ""),
+    "rate_limit_submit_max": int(os.environ.get("RATE_LIMIT_SUBMIT_MAX", "120")),
+    "rate_limit_submit_window_sec": int(
+        os.environ.get("RATE_LIMIT_SUBMIT_WINDOW_SEC", "60")
+    ),
     "node_labels": {
         "node_a": "Node A (Layers 0–10)",
         "node_b": "Node B (Layers 11–21)",
@@ -48,6 +54,33 @@ state = {
     "node_metrics": {},       # {node_id: {loss, step, timestamp, ...}}
     "activity_log": [],       # recent events for the activity feed
 }
+
+# Per-client timestamps (monotonic) for POST /submit rate limiting
+_submit_rate_buckets: dict[str, list[float]] = {}
+
+
+def _submit_rate_allow(client_key: str) -> bool:
+    """Return True if the client may POST /submit (sliding window)."""
+    now = time.monotonic()
+    window = max(1, CONFIG["rate_limit_submit_window_sec"])
+    cap = max(1, CONFIG["rate_limit_submit_max"])
+    bucket = _submit_rate_buckets.setdefault(client_key, [])
+    cutoff = now - window
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= cap:
+        return False
+    bucket.append(now)
+    return True
+
+
+def _client_key_for_rate_limit(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip() or "unknown"
+    if request.client:
+        return request.client.host
+    return "unknown"
 
 
 def _timestamp() -> str:
@@ -153,6 +186,22 @@ def fedavg_merge() -> tuple[str, bool]:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="PEFT Aggregator")
+
+
+@app.middleware("http")
+async def limit_submit_rate(request: Request, call_next):
+    if request.method != "POST":
+        return await call_next(request)
+    path = request.url.path.rstrip("/") or "/"
+    if not path.endswith("/submit"):
+        return await call_next(request)
+    key = _client_key_for_rate_limit(request)
+    if not _submit_rate_allow(key):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many submit requests; try again later."},
+        )
+    return await call_next(request)
 
 
 @app.get("/health")

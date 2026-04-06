@@ -16,12 +16,15 @@ def client(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "")
     monkeypatch.setenv("MODEL_REPO_ID", "")
     monkeypatch.setenv("NODE_SECRET", "test_secret_roundtrip")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_MAX", "10000")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_WINDOW_SEC", "60")
 
     import importlib
 
     import app as app_module
 
     importlib.reload(app_module)
+    app_module._submit_rate_buckets.clear()
 
     # Hard reset in-memory state (reload re-executes module but keeps clarity)
     app_module.state["current_round"] = 1
@@ -50,6 +53,34 @@ def test_status_ok(client):
     assert data["current_round"] == 1
     assert data["submitted_nodes"] == []
     assert "node_a" in data["expected_nodes"]
+
+
+def test_submit_rate_limit(client, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "")
+    monkeypatch.setenv("MODEL_REPO_ID", "")
+    monkeypatch.setenv("NODE_SECRET", "rl_secret")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_MAX", "4")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_WINDOW_SEC", "300")
+
+    import importlib
+
+    import app as app_module
+
+    importlib.reload(app_module)
+    app_module._submit_rate_buckets.clear()
+    app_module.state["current_round"] = 1
+    app_module.state["submitted_nodes"] = []
+    app_module.state["node_metrics"] = {}
+
+    with TestClient(app_module.app) as tc:
+        secret = "rl_secret"
+        body = {"node_id": "node_a", "secret_key": secret}
+        for i in range(4):
+            r = tc.post("/submit", json=body)
+            assert r.status_code == 200, r.text
+        r5 = tc.post("/submit", json=body)
+        assert r5.status_code == 429
+        assert "Too many" in r5.json().get("detail", "")
 
 
 def test_submit_invalid_secret(client):
