@@ -155,6 +155,12 @@ def fedavg_merge() -> tuple[str, bool]:
 app = FastAPI(title="PEFT Aggregator")
 
 
+@app.get("/health")
+def health():
+    """Liveness probe — no Hub calls, no mutation of training state."""
+    return {"ok": True}
+
+
 class SubmitRequest(BaseModel):
     node_id: str
     secret_key: str
