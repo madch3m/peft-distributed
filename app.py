@@ -67,14 +67,18 @@ def _log_activity(message: str):
 # FedAvg
 # ---------------------------------------------------------------------------
 
-def fedavg_merge() -> str:
-    """Download adapter states from all nodes, average, upload merged checkpoint."""
+def fedavg_merge() -> tuple[str, bool]:
+    """Download adapter states from all nodes, average, upload merged checkpoint.
+
+    Returns:
+        (message, success). success=False means the round should not advance.
+    """
     api = HfApi(token=CONFIG["hf_token"])
     repo = CONFIG["model_repo_id"]
     rnd = state["current_round"]
 
     if not repo or not CONFIG["hf_token"]:
-        return "Skipped merge — MODEL_REPO_ID or HF_TOKEN not set."
+        return "Skipped merge — MODEL_REPO_ID or HF_TOKEN not set.", True
 
     adapter_states = []
     for node_id in CONFIG["expected_nodes"]:
@@ -86,46 +90,62 @@ def fedavg_merge() -> str:
             )
             adapter_states.append(load_file(path))
         except Exception as e:
-            return f"FedAvg failed — could not load {node_id}: {e}"
+            return f"FedAvg failed — could not load {node_id}: {e}", False
 
-    # Average all tensors
-    merged = {}
-    keys = adapter_states[0].keys()
-    for key in keys:
-        stacked = [s[key].float() for s in adapter_states]
-        merged[key] = sum(stacked) / len(stacked)
+    ref_keys = set(adapter_states[0].keys())
+    for i, node_id in enumerate(CONFIG["expected_nodes"]):
+        keys_i = set(adapter_states[i].keys())
+        if keys_i != ref_keys:
+            missing = ref_keys - keys_i
+            extra = keys_i - ref_keys
+            return (
+                f"FedAvg failed — {node_id} tensor keys mismatch "
+                f"(missing={sorted(missing)[:5]!s} extra={sorted(extra)[:5]!s})",
+                False,
+            )
 
-    # Save merged checkpoint
     merged_path = "/tmp/merged_adapter_model.safetensors"
-    save_file(merged, merged_path)
+    try:
+        merged = {}
+        for key in ref_keys:
+            stacked = [s[key].float() for s in adapter_states]
+            merged[key] = sum(stacked) / len(stacked)
+        save_file(merged, merged_path)
+    except Exception as e:
+        return f"FedAvg failed — tensor merge/save: {e}", False
 
-    api.upload_file(
-        path_or_fileobj=merged_path,
-        path_in_repo=f"merged/round_{rnd}/adapter_model.safetensors",
-        repo_id=repo,
-        token=CONFIG["hf_token"],
-        commit_message=f"FedAvg merge — round {rnd}",
+    try:
+        api.upload_file(
+            path_or_fileobj=merged_path,
+            path_in_repo=f"merged/round_{rnd}/adapter_model.safetensors",
+            repo_id=repo,
+            token=CONFIG["hf_token"],
+            commit_message=f"FedAvg merge — round {rnd}",
+        )
+
+        training_state = {
+            "current_round": rnd + 1,
+            "last_merged_round": rnd,
+            "timestamp": _timestamp(),
+        }
+        state_path = "/tmp/training_state.json"
+        with open(state_path, "w") as f:
+            json.dump(training_state, f, indent=2)
+
+        api.upload_file(
+            path_or_fileobj=state_path,
+            path_in_repo="training_state.json",
+            repo_id=repo,
+            token=CONFIG["hf_token"],
+            commit_message=f"Advance to round {rnd + 1}",
+        )
+    except Exception as e:
+        return f"FedAvg failed — Hub upload: {e}", False
+
+    return (
+        f"FedAvg complete for round {rnd}. Advanced to round {rnd + 1}.",
+        True,
     )
-
-    # Update training_state.json
-    training_state = {
-        "current_round": rnd + 1,
-        "last_merged_round": rnd,
-        "timestamp": _timestamp(),
-    }
-    state_path = "/tmp/training_state.json"
-    with open(state_path, "w") as f:
-        json.dump(training_state, f, indent=2)
-
-    api.upload_file(
-        path_or_fileobj=state_path,
-        path_in_repo="training_state.json",
-        repo_id=repo,
-        token=CONFIG["hf_token"],
-        commit_message=f"Advance to round {rnd + 1}",
-    )
-
-    return f"FedAvg complete for round {rnd}. Advanced to round {rnd + 1}."
 
 
 # ---------------------------------------------------------------------------
@@ -192,13 +212,19 @@ def submit_node(req: SubmitRequest):
     }
 
     # Log activity
-    _log_activity(f"{req.node_id} submitted round {state['current_round']}"
-                  + (f" (loss: {req.avg_loss:.4f})" if req.avg_loss else ""))
+    loss_suffix = (
+        f" (loss: {req.avg_loss:.4f})" if req.avg_loss is not None else ""
+    )
+    _log_activity(
+        f"{req.node_id} submitted round {state['current_round']}{loss_suffix}"
+    )
 
     # Check if all nodes have submitted
     if set(state["submitted_nodes"]) == set(CONFIG["expected_nodes"]):
-        _log_activity(f"All nodes submitted — starting FedAvg for round {state['current_round']}")
-        merge_result = fedavg_merge()
+        _log_activity(
+            f"All nodes submitted — starting FedAvg for round {state['current_round']}"
+        )
+        merge_result, merge_ok = fedavg_merge()
 
         # Capture per-node losses in history
         round_metrics = {
@@ -206,22 +232,31 @@ def submit_node(req: SubmitRequest):
             for nid in CONFIG["expected_nodes"]
         }
 
-        state["history"].append({
-            "round": state["current_round"],
-            "completed_at": _timestamp(),
-            "merge_result": merge_result,
-            "node_losses": round_metrics,
-        })
+        if merge_ok:
+            state["history"].append({
+                "round": state["current_round"],
+                "completed_at": _timestamp(),
+                "merge_result": merge_result,
+                "node_losses": round_metrics,
+            })
 
-        _log_activity(f"Round {state['current_round']} FedAvg complete")
+            _log_activity(f"Round {state['current_round']} FedAvg complete")
 
-        state["current_round"] += 1
+            state["current_round"] += 1
+            state["submitted_nodes"] = []
+
+            return {
+                "status": "round_complete",
+                "merge_result": merge_result,
+                "new_round": state["current_round"],
+            }
+
+        _log_activity(f"FedAvg failed (round {state['current_round']}): {merge_result}")
         state["submitted_nodes"] = []
-
         return {
-            "status": "round_complete",
+            "status": "merge_failed",
             "merge_result": merge_result,
-            "new_round": state["current_round"],
+            "current_round": state["current_round"],
         }
 
     return {
@@ -299,16 +334,25 @@ def _node_cards_md():
     return "\n".join(lines)
 
 
+def _short_node_header(n: str) -> str:
+    full = CONFIG["node_labels"].get(n, n)
+    parts = full.split()
+    if len(parts) >= 2:
+        return f"{parts[0]} {parts[1]}"
+    return full
+
+
 def _loss_history_md():
     """Per-round loss table and trend."""
     if not state["history"]:
         return "### Training Metrics\n\n_No completed rounds yet._"
 
     lines = ["### Training Metrics\n"]
-    lines.append("| Round | " + " | ".join(
-        CONFIG["node_labels"].get(n, n).split(" ")[0] + " " + CONFIG["node_labels"].get(n, n).split(" ")[1]
-        for n in CONFIG["expected_nodes"]
-    ) + " | Avg |")
+    lines.append(
+        "| Round | "
+        + " | ".join(_short_node_header(n) for n in CONFIG["expected_nodes"])
+        + " | Avg |"
+    )
     lines.append("|---|" + "---|" * (len(CONFIG["expected_nodes"]) + 1))
 
     for h in state["history"]:
