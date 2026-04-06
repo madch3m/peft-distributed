@@ -17,6 +17,7 @@ pinned: false
 | Endpoint | Method | Description |
 |---|---|---|
 | `/` | GET | Gradio dashboard |
+| `/health` | GET | Liveness probe (`{"ok": true}`); no Hub I/O |
 | `/submit` | POST | Node submits round completion |
 | `/status` | GET | Current aggregation state (JSON) |
 | `/reset` | POST | Reset to round 1 |
@@ -58,6 +59,10 @@ from aggregator_client import notify_aggregator
 notify_aggregator(AGGREGATOR_URL, "node_a", NODE_SECRET, round_num=1)
 ```
 
+If you pass **`round_num`**, it must equal the aggregator’s **`current_round`** (see `GET /status`); otherwise the Space returns **409**.
+
+When the last node completes a round, the client may receive **`merge_failed`** if FedAvg or Hub upload fails. **`aggregator_client.notify_aggregator`** then raises **`AggregatorMergeFailed`** with **`e.payload["merge_result"]`** explaining the error (fix Hub paths or permissions, then have nodes submit again).
+
 Nodes do **not** need `MODEL_REPO_ID` — only the aggregator uses it to download/upload adapter weights.
 
 #### 3. Local testing
@@ -71,6 +76,14 @@ export NODE_SECRET="local_test_secret"
 ```
 
 Without these, the app defaults to empty strings (merge is skipped) and `"local_test_secret"` for the node secret.
+
+## Operator notes
+
+- **Secrets:** Never commit `HF_TOKEN`, `NODE_SECRET`, or tokens in git remotes. Use Space **Repository secrets** and a local env or credential helper.
+- **Reset:** `POST /reset` with JSON `{"secret_key": "<NODE_SECRET>"}` clears round state to 1 (same secret as nodes).
+- **Rate limits:** `POST /submit` is limited per client IP (first `X-Forwarded-For` hop when present). Override with **`RATE_LIMIT_SUBMIT_MAX`** (default 120) and **`RATE_LIMIT_SUBMIT_WINDOW_SEC`** (default 60).
+- **Logs:** Set **`LOG_LEVEL`** (e.g. `DEBUG`, `INFO`, `WARNING`) for the `peft.aggregator` logger on stdout.
+- **Public Space:** `GET /status` is world-readable on a public Space; use a private Space if round visibility matters.
 
 ## Architecture
 
