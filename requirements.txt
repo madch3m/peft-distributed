@@ -1,4 +1,7 @@
-fastapi>=0.104.0,<0.136.0
+# FastAPI 0.116+ pulls Starlette 1.x, which breaks Gradio 4.44.x (GET / → Jinja
+# "unhashable type: 'dict'"). Keep Starlette 0.41.x until Gradio is upgraded.
+fastapi>=0.104.0,<0.116.0
+starlette>=0.37.2,<0.42.0
 uvicorn>=0.24.0,<0.44.0
 huggingface-hub>=0.20.0,<0.24.0
 safetensors>=0.4.0,<0.8.0

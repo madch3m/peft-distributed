@@ -105,4 +105,6 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 uvicorn app:app --host 0.0.0.0 --port 7860 --reload
 ```
 
+**Note:** `requirements.txt` caps **FastAPI** and **Starlette** below versions that ship **Starlette 1.x**. Gradio **4.44.x** is incompatible with that stack (the Space would return **500** on `GET /` with Jinja `unhashable type: 'dict'`). Upgrade Gradio before raising those caps.
+
 Deadline: April 20, 2026 · Lead target April 13
