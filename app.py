@@ -19,6 +19,10 @@ import time
 import datetime
 
 import gradio as gr
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -362,9 +366,13 @@ def submit_node(req: SubmitRequest):
         )
         merge_result, merge_ok = fedavg_merge()
 
-        # Capture per-node losses in history
+        # Capture per-node losses and steps in history
         round_metrics = {
             nid: state["node_metrics"].get(nid, {}).get("avg_loss")
+            for nid in CONFIG["expected_nodes"]
+        }
+        round_steps = {
+            nid: state["node_metrics"].get(nid, {}).get("steps_completed")
             for nid in CONFIG["expected_nodes"]
         }
 
@@ -374,6 +382,7 @@ def submit_node(req: SubmitRequest):
                 "completed_at": _timestamp(),
                 "merge_result": merge_result,
                 "node_losses": round_metrics,
+                "node_steps": round_steps,
             })
 
             _log_activity(f"Round {state['current_round']} FedAvg complete")
@@ -385,6 +394,7 @@ def submit_node(req: SubmitRequest):
 
             state["current_round"] += 1
             state["submitted_nodes"] = []
+            state["node_metrics"] = {}
 
             return {
                 "status": "round_complete",
@@ -537,6 +547,58 @@ def _loss_history_md():
     return "\n".join(lines)
 
 
+def _convergence_figure():
+    """Line chart: round vs per-node submitted avg loss (+ mean across nodes)."""
+    if not state["history"]:
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    rounds = [h["round"] for h in state["history"]]
+
+    for nid in CONFIG["expected_nodes"]:
+        ys = []
+        for h in state["history"]:
+            loss = h.get("node_losses", {}).get(nid)
+            ys.append(loss if loss is not None else float("nan"))
+        label = CONFIG["node_labels"].get(nid, nid)
+        ax.plot(rounds, ys, marker="o", linewidth=1.5, label=label)
+
+    means = []
+    for h in state["history"]:
+        vals = [v for v in h.get("node_losses", {}).values() if v is not None]
+        means.append(float(np.mean(vals)) if vals else float("nan"))
+    ax.plot(rounds, means, color="black", linestyle="--", linewidth=2, label="Mean")
+
+    ax.set_xlabel("Round")
+    ax.set_ylabel("Avg loss (submitted)")
+    ax.set_title("Convergence (per node)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def _steps_bar_figure():
+    """Bar chart: steps_completed per node for the last merged round."""
+    if not state["history"]:
+        return None
+
+    h = state["history"][-1]
+    steps_map = h.get("node_steps", {})
+    labels = [_short_node_header(n) for n in CONFIG["expected_nodes"]]
+    vals = [steps_map.get(n) for n in CONFIG["expected_nodes"]]
+    if all(v is None for v in vals):
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 3))
+    plot_vals = [0 if v is None else int(v) for v in vals]
+    ax.bar(labels, plot_vals, color="steelblue")
+    ax.set_ylabel("Steps completed")
+    ax.set_title(f"Steps per node (merged round {h['round']})")
+    fig.tight_layout()
+    return fig
+
+
 def _merged_adapters_md():
     """Links to merged adapter files on HF Hub."""
     repo = CONFIG["model_repo_id"]
@@ -580,22 +642,37 @@ with gr.Blocks(title="PEFT Aggregator", theme=gr.themes.Soft()) as demo:
             loss_display = gr.Markdown(_loss_history_md)
 
     with gr.Row():
+        convergence_plot = gr.Plot(label="Convergence (avg loss per round)")
+        steps_plot = gr.Plot(label="Steps completed (last merged round)")
+
+    with gr.Row():
         with gr.Column():
             adapters_display = gr.Markdown(_merged_adapters_md)
         with gr.Column():
             activity_display = gr.Markdown(_activity_log_md)
 
     refresh_btn = gr.Button("🔄 Refresh Dashboard", variant="primary")
-    refresh_btn.click(
-        fn=lambda: (
-            _round_progress_md(),
-            _node_cards_md(),
-            _loss_history_md(),
-            _merged_adapters_md(),
-            _activity_log_md(),
-        ),
-        outputs=[progress_display, node_cards, loss_display, adapters_display, activity_display],
+    _dashboard_refresh = lambda: (
+        _round_progress_md(),
+        _node_cards_md(),
+        _loss_history_md(),
+        _convergence_figure(),
+        _steps_bar_figure(),
+        _merged_adapters_md(),
+        _activity_log_md(),
     )
+    _dashboard_outputs = [
+        progress_display,
+        node_cards,
+        loss_display,
+        convergence_plot,
+        steps_plot,
+        adapters_display,
+        activity_display,
+    ]
+
+    refresh_btn.click(fn=_dashboard_refresh, outputs=_dashboard_outputs)
+    demo.load(fn=_dashboard_refresh, outputs=_dashboard_outputs)
 
 app = gr.mount_gradio_app(app, demo, path="/")
 

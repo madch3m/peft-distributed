@@ -33,6 +33,8 @@ def notify_aggregator(
     node_id: str,
     secret_key: str,
     round_num: int | None = None,
+    avg_loss: float | None = None,
+    steps_completed: int | None = None,
     timeout: int = 30,
 ) -> dict:
     """Notify the aggregator that this node has finished its current round.
@@ -42,6 +44,8 @@ def notify_aggregator(
         node_id: One of 'node_a', 'node_b', 'node_c'.
         secret_key: Shared secret for authentication.
         round_num: Optional current round number for verification.
+        avg_loss: Optional mean training loss for this round (shown on Space dashboard).
+        steps_completed: Optional step count for this round (e.g. CONFIG steps_per_round).
         timeout: Request timeout in seconds.
 
     Returns:
@@ -56,6 +60,10 @@ def notify_aggregator(
     }
     if round_num is not None:
         payload["round_num"] = round_num
+    if avg_loss is not None:
+        payload["avg_loss"] = avg_loss
+    if steps_completed is not None:
+        payload["steps_completed"] = steps_completed
 
     url = f"{aggregator_url.rstrip('/')}/submit"
     response = requests.post(url, json=payload, timeout=timeout)

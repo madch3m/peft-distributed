@@ -151,14 +151,16 @@ def test_submit_unknown_node(client):
 def test_full_round_merge_skipped_no_hf(client):
     tc, m = client
     secret = m.CONFIG["node_secret"]
+    losses = {"node_a": 1.5, "node_b": 1.6, "node_c": 1.55}
+    steps = {"node_a": 100, "node_b": 101, "node_c": 99}
     for nid in ("node_a", "node_b", "node_c"):
         r = tc.post(
             "/submit",
             json={
                 "node_id": nid,
                 "secret_key": secret,
-                "avg_loss": 1.5 if nid == "node_a" else None,
-                "steps_completed": 10,
+                "avg_loss": losses[nid],
+                "steps_completed": steps[nid],
             },
         )
         assert r.status_code == 200, r.text
@@ -174,6 +176,12 @@ def test_full_round_merge_skipped_no_hf(client):
     assert st["current_round"] == 2
     assert st["submitted_nodes"] == []
     assert len(m.state["history"]) == 1
+
+    last = m.state["history"][-1]
+    for nid in ("node_a", "node_b", "node_c"):
+        assert last["node_losses"][nid] == losses[nid]
+        assert last["node_steps"][nid] == steps[nid]
+    assert m.state["node_metrics"] == {}
 
 
 def test_reset(client):
@@ -246,10 +254,14 @@ def test_status_requires_header_when_status_read_secret_set(client, monkeypatch)
 
 def test_gradio_markdown_helpers_no_crash(client):
     """Dashboard builders used by Gradio refresh must not raise."""
+    import matplotlib.pyplot as plt
+
     tc, m = client
     m._round_progress_md()
     m._node_cards_md()
     m._loss_history_md()
+    assert m._convergence_figure() is None
+    assert m._steps_bar_figure() is None
     m._merged_adapters_md()
     m._activity_log_md()
 
@@ -260,6 +272,13 @@ def test_gradio_markdown_helpers_no_crash(client):
     m._loss_history_md()
     m._merged_adapters_md()
     m._activity_log_md()
+
+    fig_c = m._convergence_figure()
+    if fig_c is not None:
+        plt.close(fig_c)
+    fig_s = m._steps_bar_figure()
+    if fig_s is not None:
+        plt.close(fig_s)
 
 
 def test_openapi_lists_core_routes(client):
