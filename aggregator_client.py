@@ -13,6 +13,20 @@ import time
 import requests
 
 
+def _normalize_aggregator_base_url(url: str) -> str:
+    """Strip whitespace/slashes and ensure an HTTP(S) scheme for requests.
+
+    Colab configs often omit ``https://``, which causes requests to raise
+    ``MissingSchema``.
+    """
+    base = url.strip().rstrip("/")
+    if not base:
+        raise ValueError("aggregator_url is empty")
+    if "://" not in base:
+        base = "https://" + base.lstrip("/")
+    return base
+
+
 def _status_headers(status_secret: str | None) -> dict[str, str]:
     if status_secret:
         return {"X-Status-Secret": status_secret}
@@ -40,7 +54,8 @@ def notify_aggregator(
     """Notify the aggregator that this node has finished its current round.
 
     Args:
-        aggregator_url: Base URL of the aggregator Space.
+        aggregator_url: Base URL of the aggregator Space (with or without
+            ``https://``; missing scheme defaults to ``https://``).
         node_id: One of 'node_a', 'node_b', 'node_c'.
         secret_key: Shared secret for authentication.
         round_num: Optional current round number for verification.
@@ -65,7 +80,7 @@ def notify_aggregator(
     if steps_completed is not None:
         payload["steps_completed"] = steps_completed
 
-    base = aggregator_url.strip().rstrip("/")
+    base = _normalize_aggregator_base_url(aggregator_url)
     url = f"{base}/submit"
     response = requests.post(url, json=payload, timeout=timeout)
     if response.status_code == 404:
@@ -91,7 +106,8 @@ def poll_for_next_round(
     """Block until the aggregator advances past the current round.
 
     Args:
-        aggregator_url: Base URL of the aggregator Space.
+        aggregator_url: Base URL of the aggregator Space (with or without
+            ``https://``; missing scheme defaults to ``https://``).
         current_round: The round we just finished.
         poll_interval: Seconds between status checks.
         max_wait: Maximum seconds to wait before raising TimeoutError.
@@ -104,7 +120,8 @@ def poll_for_next_round(
     Raises:
         TimeoutError: If max_wait is exceeded.
     """
-    url = f"{aggregator_url.rstrip('/')}/status"
+    base = _normalize_aggregator_base_url(aggregator_url)
+    url = f"{base}/status"
     headers = _status_headers(status_secret)
     elapsed = 0
 
@@ -140,7 +157,7 @@ def check_aggregator(
     status_secret: str | None = None,
 ) -> dict:
     """Return aggregation state from GET /status (round, submitted_nodes, …)."""
-    url = f"{aggregator_url.rstrip('/')}/status"
+    url = f"{_normalize_aggregator_base_url(aggregator_url)}/status"
     response = requests.get(
         url,
         timeout=timeout,
@@ -156,7 +173,7 @@ def reset_aggregator(
     timeout: int = 30,
 ) -> dict:
     """Reset aggregator to round 1. Use ADMIN_SECRET if the Space defines it, else NODE_SECRET."""
-    url = f"{aggregator_url.rstrip('/')}/reset"
+    url = f"{_normalize_aggregator_base_url(aggregator_url)}/reset"
     response = requests.post(
         url,
         json={"secret_key": secret_key},
@@ -168,7 +185,7 @@ def reset_aggregator(
 
 def health_aggregator(aggregator_url: str, timeout: int = 10) -> dict:
     """Liveness probe via GET /health; does not depend on training state."""
-    url = f"{aggregator_url.rstrip('/')}/health"
+    url = f"{_normalize_aggregator_base_url(aggregator_url)}/health"
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
     return response.json()
