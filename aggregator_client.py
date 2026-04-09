@@ -10,6 +10,8 @@ Functions:
 """
 
 import time
+from urllib.parse import urlsplit, urlunsplit
+
 import requests
 
 
@@ -18,12 +20,30 @@ def _normalize_aggregator_base_url(url: str) -> str:
 
     Colab configs often omit ``https://``, which causes requests to raise
     ``MissingSchema``.
+
+    Also fixes a common mistake: pasting ``https://OWNER/SPACE.hf.space`` (slash)
+    instead of the real host ``https://OWNER-SPACE.hf.space``. Otherwise the HTTP
+    client treats ``OWNER`` as the hostname and fails DNS.
     """
     base = url.strip().rstrip("/")
     if not base:
         raise ValueError("aggregator_url is empty")
     if "://" not in base:
         base = "https://" + base.lstrip("/")
+
+    parts = urlsplit(base)
+    scheme, netloc, path, query, fragment = parts
+    path_clean = path.rstrip("/")
+
+    # Wrong: https://dev-the-dev91/instruction-fine-tuning-budget.hf.space
+    # Right: https://dev-the-dev91-instruction-fine-tuning-budget.hf.space
+    if path_clean.startswith("/"):
+        leaf = path_clean.lstrip("/")
+        if leaf.endswith(".hf.space") and not netloc.endswith(".hf.space"):
+            netloc = f"{netloc}-{leaf}"
+            path = ""
+
+    base = urlunsplit((scheme, netloc, path, query, fragment)).rstrip("/")
     return base
 
 

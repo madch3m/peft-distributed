@@ -55,7 +55,7 @@ AGGREGATOR_URL = "https://your-username-your-space.hf.space"
 NODE_SECRET = "my-super-secret-123"  # must match the Space secret
 ```
 
-Use the Space’s **direct app host** as `AGGREGATOR_URL`: **`https://<owner>-<space-name>.hf.space`** (open your Space → use the **App** tab URL, or copy from the Space card). It is **not** `huggingface.co/spaces/user/repo`, **not** `user/repo.hf.space` with a slash, and **not** a model repo id. The client accepts the host **with or without** `https://` (missing scheme defaults to `https://`). API paths are `/submit`, `/status`, `/health`, `/reset`.
+Use the Space’s **direct app host** as `AGGREGATOR_URL`: **`https://<owner>-<space-name>.hf.space`** (open your Space → use the **App** tab URL, or copy from the Space card). It is **not** `huggingface.co/spaces/user/repo`, **not** `https://<owner>/<space>.hf.space` (a slash makes the client try to resolve `<owner>` as the hostname and DNS fails), and **not** a model repo id. The client accepts the host **with or without** `https://` (missing scheme defaults to `https://`) and **rewrites** the common `owner/space.hf.space` typo into `owner-space.hf.space`. API paths are `/submit`, `/status`, `/health`, `/reset`.
 
 Then call the aggregator client:
 
