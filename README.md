@@ -55,6 +55,8 @@ AGGREGATOR_URL = "https://your-username-your-space.hf.space"
 NODE_SECRET = "my-super-secret-123"  # must match the Space secret
 ```
 
+Use the Space’s **`.hf.space`** URL as `AGGREGATOR_URL` (the API lives at `https://… .hf.space/submit`, `…/status`, etc.). The `huggingface.co/spaces/...` browser link is not the same host and will not find `/submit`.
+
 Then call the aggregator client:
 
 ```python

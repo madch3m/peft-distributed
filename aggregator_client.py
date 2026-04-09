@@ -65,8 +65,15 @@ def notify_aggregator(
     if steps_completed is not None:
         payload["steps_completed"] = steps_completed
 
-    url = f"{aggregator_url.rstrip('/')}/submit"
+    base = aggregator_url.strip().rstrip("/")
+    url = f"{base}/submit"
     response = requests.post(url, json=payload, timeout=timeout)
+    if response.status_code == 404:
+        raise RuntimeError(
+            f"No route at {url!r} (404). Use the Space app host that serves the API "
+            "(typically https://YOUR_SPACE_NAME.hf.space), not the huggingface.co/spaces "
+            "HTML page URL. Path must be exactly /submit."
+        )
     response.raise_for_status()
     data = response.json()
     if data.get("status") == "merge_failed":
