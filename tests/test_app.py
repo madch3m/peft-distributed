@@ -6,7 +6,9 @@ Uses empty HF credentials so FedAvg skips Hub I/O (no network required).
 
 from __future__ import annotations
 
+import json
 import time
+from unittest import mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -295,6 +297,67 @@ def test_gradio_markdown_helpers_no_crash(client):
     fig_s = m._steps_bar_figure()
     if fig_s is not None:
         plt.close(fig_s)
+
+
+def test_restore_state_from_hub(monkeypatch, tmp_path):
+    """Simulate a Space restart that restores state from Hub."""
+    monkeypatch.setenv("HF_TOKEN", "fake_token")
+    monkeypatch.setenv("MODEL_REPO_ID", "fake/repo")
+    monkeypatch.setenv("NODE_SECRET", "test_secret_roundtrip")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_MAX", "10000")
+    monkeypatch.setenv("RATE_LIMIT_SUBMIT_WINDOW_SEC", "60")
+
+    # Write a fake aggregator_state.json that hf_hub_download will "return"
+    saved_state = {
+        "current_round": 4,
+        "last_merged_round": 3,
+        "history": [
+            {"round": 1, "completed_at": "t1", "merge_result": "ok",
+             "node_losses": {"node_a": 1.5, "node_b": 1.6, "node_c": 1.55},
+             "node_steps": {"node_a": 100, "node_b": 100, "node_c": 100}},
+            {"round": 2, "completed_at": "t2", "merge_result": "ok",
+             "node_losses": {"node_a": 1.3, "node_b": 1.4, "node_c": 1.35},
+             "node_steps": {"node_a": 100, "node_b": 100, "node_c": 100}},
+            {"round": 3, "completed_at": "t3", "merge_result": "ok",
+             "node_losses": {"node_a": 1.1, "node_b": 1.2, "node_c": 1.15},
+             "node_steps": {"node_a": 100, "node_b": 100, "node_c": 100}},
+        ],
+        "timestamp": "2026-04-11T00:00:00Z",
+    }
+    state_file = tmp_path / "aggregator_state.json"
+    state_file.write_text(json.dumps(saved_state))
+
+    def fake_hf_hub_download(repo_id, filename, token):
+        if filename == "aggregator_state.json":
+            return str(state_file)
+        raise FileNotFoundError(filename)
+
+    import importlib
+    import app as app_module
+
+    # Patch hf_hub_download before reload so _restore_state_from_hub uses it
+    with mock.patch.object(app_module, "hf_hub_download", side_effect=fake_hf_hub_download):
+        importlib.reload(app_module)
+        # Re-patch after reload (reload re-imports the name)
+        app_module.hf_hub_download = fake_hf_hub_download
+        app_module._restore_state_from_hub()
+
+    assert app_module.state["current_round"] == 4
+    assert len(app_module.state["history"]) == 3
+    assert app_module.state["submitted_nodes"] == []
+    assert app_module.state["merging"] is False
+
+    # Verify the dashboard still works with restored history
+    with TestClient(app_module.app) as tc:
+        st = tc.get("/status").json()
+        assert st["current_round"] == 4
+
+
+def test_persist_state_no_op_without_credentials(client):
+    """_persist_state_to_hub should silently no-op when HF creds are empty."""
+    _, m = client
+    # Should not raise
+    m._persist_state_to_hub()
 
 
 def test_openapi_lists_core_routes(client):

@@ -91,6 +91,88 @@ state = {
 
 _state_lock = threading.Lock()
 
+
+def _persist_state_to_hub() -> None:
+    """Upload aggregator state to Hub so a Space restart can resume.
+
+    Called after round completion and reset.  Runs inside the background
+    merge thread (or the reset endpoint), so it won't block node requests.
+    """
+    repo = CONFIG["model_repo_id"]
+    token = CONFIG["hf_token"]
+    if not repo or not token:
+        return
+
+    payload = {
+        "current_round": state["current_round"],
+        "last_merged_round": state["current_round"] - 1,
+        "history": state["history"],
+        "timestamp": _timestamp(),
+    }
+    path = "/tmp/aggregator_state.json"
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    try:
+        api = HfApi(token=token)
+        api.upload_file(
+            path_or_fileobj=path,
+            path_in_repo="aggregator_state.json",
+            repo_id=repo,
+            token=token,
+            commit_message=f"Aggregator state — round {state['current_round']}",
+        )
+        agg_log.info("persisted aggregator state to Hub (round %s)", state["current_round"])
+    except Exception as e:
+        agg_log.warning("failed to persist aggregator state: %s", e)
+
+
+def _restore_state_from_hub() -> None:
+    """On startup, download aggregator_state.json (or training_state.json)
+    from Hub and restore current_round + history.
+
+    Falls back to training_state.json (written by fedavg_merge) if the
+    newer aggregator_state.json does not exist yet.
+    """
+    repo = CONFIG["model_repo_id"]
+    token = CONFIG["hf_token"]
+    if not repo or not token:
+        agg_log.info("no HF credentials — starting from round 1")
+        return
+
+    # Try aggregator_state.json first (has history), then training_state.json
+    for filename in ("aggregator_state.json", "training_state.json"):
+        try:
+            path = hf_hub_download(repo_id=repo, filename=filename, token=token)
+            with open(path) as f:
+                saved = json.load(f)
+
+            restored_round = saved.get("current_round", 1)
+            state["current_round"] = restored_round
+            state["history"] = saved.get("history", [])
+            state["last_update"] = saved.get("timestamp")
+            state["submitted_nodes"] = []
+            state["node_metrics"] = {}
+            state["merging"] = False
+            state["merge_error"] = None
+
+            _log_activity(f"State restored from Hub ({filename}) — resuming at round {restored_round}")
+            agg_log.info(
+                "restored state from %s: round=%s history_len=%s",
+                filename,
+                restored_round,
+                len(state["history"]),
+            )
+            return
+        except Exception:
+            continue
+
+    agg_log.info("no saved state on Hub — starting from round 1")
+
+
+# Restore on import (runs when the Space boots)
+_restore_state_from_hub()
+
 # Per-client timestamps (monotonic) for POST /submit rate limiting
 _submit_rate_buckets: dict[str, list[float]] = {}
 
@@ -254,6 +336,10 @@ def _background_merge(
             state["submitted_nodes"] = []
 
         state["merging"] = False
+
+    # Persist outside the lock (Hub I/O is slow)
+    if merge_ok:
+        _persist_state_to_hub()
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +560,7 @@ def reset_state(req: ResetRequest):
     state["merge_error"] = None
 
     _log_activity("State reset to round 1")
+    _persist_state_to_hub()
 
     return {"status": "reset", "current_round": 1}
 
