@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import json
+import threading
 import time
 import datetime
 
@@ -84,7 +85,11 @@ state = {
     "last_update": None,
     "node_metrics": {},       # {node_id: {loss, step, timestamp, ...}}
     "activity_log": [],       # recent events for the activity feed
+    "merging": False,         # True while FedAvg is running in background
+    "merge_error": None,      # set if background merge failed
 }
+
+_state_lock = threading.Lock()
 
 # Per-client timestamps (monotonic) for POST /submit rate limiting
 _submit_rate_buckets: dict[str, list[float]] = {}
@@ -212,6 +217,45 @@ def fedavg_merge() -> tuple[str, bool]:
     )
 
 
+def _background_merge(
+    merge_round: int,
+    round_metrics: dict,
+    round_steps: dict,
+) -> None:
+    """Run FedAvg in a background thread, then advance the round or record failure."""
+    try:
+        merge_result, merge_ok = fedavg_merge()
+    except Exception as exc:
+        merge_result, merge_ok = f"FedAvg exception: {exc}", False
+
+    with _state_lock:
+        if merge_ok:
+            state["history"].append({
+                "round": merge_round,
+                "completed_at": _timestamp(),
+                "merge_result": merge_result,
+                "node_losses": round_metrics,
+                "node_steps": round_steps,
+            })
+            _log_activity(f"Round {merge_round} FedAvg complete")
+            agg_log.info(
+                "fedavg_complete round=%s new_round=%s",
+                merge_round,
+                merge_round + 1,
+            )
+            state["current_round"] = merge_round + 1
+            state["submitted_nodes"] = []
+            state["node_metrics"] = {}
+        else:
+            tail = merge_result if len(merge_result) <= 400 else merge_result[:400] + "..."
+            agg_log.warning("fedavg_failed round=%s detail=%s", merge_round, tail)
+            _log_activity(f"FedAvg failed (round {merge_round}): {merge_result}")
+            state["merge_error"] = merge_result
+            state["submitted_nodes"] = []
+
+        state["merging"] = False
+
+
 # ---------------------------------------------------------------------------
 # FastAPI endpoints
 # ---------------------------------------------------------------------------
@@ -294,6 +338,8 @@ def get_status(request: Request):
             if n not in state["submitted_nodes"]
         ],
         "last_update": state["last_update"],
+        "merging": state["merging"],
+        "merge_error": state["merge_error"],
     }
 
 
@@ -326,105 +372,89 @@ def submit_node(req: SubmitRequest):
             ),
         )
 
-    if req.node_id in state["submitted_nodes"]:
-        return {
-            "status": "already_submitted",
-            "current_round": state["current_round"],
-            "submitted_nodes": state["submitted_nodes"],
-        }
-
-    state["submitted_nodes"].append(req.node_id)
-    state["last_update"] = _timestamp()
-    agg_log.info(
-        "submit accepted node_id=%s round=%s progress=%s/%s",
-        req.node_id,
-        state["current_round"],
-        len(state["submitted_nodes"]),
-        len(CONFIG["expected_nodes"]),
-    )
-
-    # Store node metrics
-    state["node_metrics"][req.node_id] = {
-        "avg_loss": req.avg_loss,
-        "steps_completed": req.steps_completed,
-        "round": state["current_round"],
-        "submitted_at": _timestamp(),
-    }
-
-    # Log activity
-    loss_suffix = (
-        f" (loss: {req.avg_loss:.4f})" if req.avg_loss is not None else ""
-    )
-    _log_activity(
-        f"{req.node_id} submitted round {state['current_round']}{loss_suffix}"
-    )
-
-    # Check if all nodes have submitted
-    if set(state["submitted_nodes"]) == set(CONFIG["expected_nodes"]):
-        _log_activity(
-            f"All nodes submitted — starting FedAvg for round {state['current_round']}"
-        )
-        merge_result, merge_ok = fedavg_merge()
-
-        # Capture per-node losses and steps in history
-        round_metrics = {
-            nid: state["node_metrics"].get(nid, {}).get("avg_loss")
-            for nid in CONFIG["expected_nodes"]
-        }
-        round_steps = {
-            nid: state["node_metrics"].get(nid, {}).get("steps_completed")
-            for nid in CONFIG["expected_nodes"]
-        }
-
-        if merge_ok:
-            state["history"].append({
-                "round": state["current_round"],
-                "completed_at": _timestamp(),
-                "merge_result": merge_result,
-                "node_losses": round_metrics,
-                "node_steps": round_steps,
-            })
-
-            _log_activity(f"Round {state['current_round']} FedAvg complete")
-            agg_log.info(
-                "fedavg_complete round=%s new_round=%s",
-                state["current_round"],
-                state["current_round"] + 1,
-            )
-
-            state["current_round"] += 1
-            state["submitted_nodes"] = []
-            state["node_metrics"] = {}
-
+    with _state_lock:
+        if req.node_id in state["submitted_nodes"]:
             return {
-                "status": "round_complete",
-                "merge_result": merge_result,
-                "new_round": state["current_round"],
+                "status": "already_submitted",
+                "current_round": state["current_round"],
+                "submitted_nodes": state["submitted_nodes"],
             }
 
-        tail = merge_result if len(merge_result) <= 400 else merge_result[:400] + "..."
-        agg_log.warning(
-            "fedavg_failed round=%s detail=%s",
+        if state["merging"]:
+            return {
+                "status": "merging",
+                "current_round": state["current_round"],
+                "submitted_nodes": state["submitted_nodes"],
+            }
+
+        state["submitted_nodes"].append(req.node_id)
+        state["last_update"] = _timestamp()
+        agg_log.info(
+            "submit accepted node_id=%s round=%s progress=%s/%s",
+            req.node_id,
             state["current_round"],
-            tail,
+            len(state["submitted_nodes"]),
+            len(CONFIG["expected_nodes"]),
         )
-        _log_activity(f"FedAvg failed (round {state['current_round']}): {merge_result}")
-        state["submitted_nodes"] = []
-        return {
-            "status": "merge_failed",
-            "merge_result": merge_result,
-            "current_round": state["current_round"],
+
+        # Store node metrics
+        state["node_metrics"][req.node_id] = {
+            "avg_loss": req.avg_loss,
+            "steps_completed": req.steps_completed,
+            "round": state["current_round"],
+            "submitted_at": _timestamp(),
         }
 
-    return {
-        "status": "submitted",
-        "current_round": state["current_round"],
-        "submitted_nodes": state["submitted_nodes"],
-        "remaining": [
-            n for n in CONFIG["expected_nodes"]
-            if n not in state["submitted_nodes"]
-        ],
-    }
+        # Log activity
+        loss_suffix = (
+            f" (loss: {req.avg_loss:.4f})" if req.avg_loss is not None else ""
+        )
+        _log_activity(
+            f"{req.node_id} submitted round {state['current_round']}{loss_suffix}"
+        )
+
+        # Check if all nodes have submitted
+        all_submitted = set(state["submitted_nodes"]) == set(CONFIG["expected_nodes"])
+
+        if all_submitted:
+            state["merging"] = True
+            state["merge_error"] = None
+            _log_activity(
+                f"All nodes submitted — starting FedAvg for round {state['current_round']}"
+            )
+            # Capture metrics under lock before spawning thread
+            round_metrics = {
+                nid: state["node_metrics"].get(nid, {}).get("avg_loss")
+                for nid in CONFIG["expected_nodes"]
+            }
+            round_steps = {
+                nid: state["node_metrics"].get(nid, {}).get("steps_completed")
+                for nid in CONFIG["expected_nodes"]
+            }
+            merge_round = state["current_round"]
+
+            thread = threading.Thread(
+                target=_background_merge,
+                args=(merge_round, round_metrics, round_steps),
+                daemon=True,
+            )
+            thread.start()
+
+            return {
+                "status": "merging",
+                "current_round": state["current_round"],
+                "submitted_nodes": state["submitted_nodes"],
+            }
+
+        return {
+            "status": "submitted",
+            "current_round": state["current_round"],
+            "submitted_nodes": state["submitted_nodes"],
+            "remaining": [
+                n for n in CONFIG["expected_nodes"]
+                if n not in state["submitted_nodes"]
+            ],
+        }
 
 
 @app.post("/reset")
@@ -440,6 +470,8 @@ def reset_state(req: ResetRequest):
     state["last_update"] = _timestamp()
     state["node_metrics"] = {}
     state["activity_log"] = []
+    state["merging"] = False
+    state["merge_error"] = None
 
     _log_activity("State reset to round 1")
 

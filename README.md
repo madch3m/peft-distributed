@@ -55,7 +55,7 @@ AGGREGATOR_URL = "https://your-username-your-space.hf.space"
 NODE_SECRET = "my-super-secret-123"  # must match the Space secret
 ```
 
-Use the Space’s **direct app host** as `AGGREGATOR_URL`: **`https://<owner>-<space-name>.hf.space`** (open your Space → use the **App** tab URL, or copy from the Space card). It is **not** `huggingface.co/spaces/user/repo`, **not** `https://<owner>/<space>.hf.space` (a slash makes the client try to resolve `<owner>` as the hostname and DNS fails), and **not** a model repo id. The client accepts the host **with or without** `https://` (missing scheme defaults to `https://`) and **rewrites** the common `owner/space.hf.space` typo into `owner-space.hf.space`. API paths are `/submit`, `/status`, `/health`, `/reset`.
+Use the Space’s **direct app host** as `AGGREGATOR_URL`: **`https://<owner>-<space-name>.hf.space`** (open your Space → use the **App** tab URL, or copy from the Space card). It is **not** `huggingface.co/spaces/user/repo`, **not** `https://<owner>/<space>.hf.space` (a slash makes the client try to resolve `<owner>` as the hostname and DNS fails), and **not** a model repo id. The client accepts the host **with or without** `https://` (missing scheme defaults to `https://`), fixes **`https:host`** typos (missing slashes after the scheme), and **rewrites** the common `owner/space.hf.space` mistake into `owner-space.hf.space`. API paths are `/submit`, `/status`, `/health`, `/reset`.
 
 Then call the aggregator client:
 
@@ -80,17 +80,9 @@ When the last node completes a round, the client may receive **`merge_failed`** 
 
 Nodes do **not** need `MODEL_REPO_ID` — only the aggregator uses it to download/upload adapter weights.
 
-#### 3. Local testing
+#### 3. Local or Space runtime env
 
-Export the variables before running the server:
-
-```bash
-export HF_TOKEN="hf_..."
-export MODEL_REPO_ID="your-username/your-model-repo"
-export NODE_SECRET="local_test_secret"
-```
-
-Without these, the app defaults to empty strings (merge is skipped) and `"local_test_secret"` for the node secret.
+For **local** runs, export `HF_TOKEN`, `MODEL_REPO_ID`, and `NODE_SECRET` (or rely on defaults described in **Testing** below). On the **Hugging Face Space**, set the same keys as **Repository secrets**.
 
 ## Operator notes
 
@@ -98,6 +90,7 @@ Without these, the app defaults to empty strings (merge is skipped) and `"local_
 - **Secrets:** Never commit `HF_TOKEN`, `NODE_SECRET`, or tokens in git remotes. Use Space **Repository secrets** and a local env or credential helper.
 - **Reset:** `POST /reset` with JSON `{"secret_key": "<ADMIN_SECRET or NODE_SECRET>"}` clears round state to 1. If `ADMIN_SECRET` is set on the Space, use that; otherwise use `NODE_SECRET`.
 - **Protected status:** When `STATUS_READ_SECRET` is set, pass the same value as header `X-Status-Secret` (see `aggregator_client.check_aggregator` / `poll_for_next_round` argument `status_secret`, and notebook `CONFIG["status_read_secret"]`).
+- **401 Unauthorized:** (1) **`POST /submit`** — JSON `secret_key` must match the Space **`NODE_SECRET`** (same string in every Colab `CONFIG["node_secret"]`). (2) **`GET /status`** — if the Space defines **`STATUS_READ_SECRET`**, clients must send that value (notebook `CONFIG["status_read_secret"]`, or clear `STATUS_READ_SECRET` on the Space if you do not need it). **`GET /health`** has no secret. A **private** Hugging Face Space can also return 401 at the edge before your app runs — open the Space in the browser while logged in, or check Space visibility settings.
 - **Rate limits:** `POST /submit` is limited per client IP (first `X-Forwarded-For` hop when present). Override with **`RATE_LIMIT_SUBMIT_MAX`** (default 120) and **`RATE_LIMIT_SUBMIT_WINDOW_SEC`** (default 60).
 - **Logs:** Set **`LOG_LEVEL`** (e.g. `DEBUG`, `INFO`, `WARNING`) for the `peft.aggregator` logger on stdout.
 - **Public Space:** `GET /status` is world-readable on a public Space; use a private Space if round visibility matters.
@@ -109,14 +102,118 @@ Without these, the app defaults to empty strings (merge is skipped) and `"local_
 - **Nodes:** 3 x Google Colab free T4 GPU
 - **Aggregation:** FedAvg over adapter states
 
-## Local Testing
+## Testing
+
+### Automated tests (CI / laptop)
+
+From the repo root, use a virtualenv with **Python 3.10+** (3.12 is fine). Install dependencies and run the suite:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+pip install pytest httpx "gradio==4.44.1"
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pytest tests/ -q
+```
+
+Tests exercise **FastAPI** routes (`/health`, `/status`, `/submit`, `/reset`) via `TestClient`. They set **`HF_TOKEN`** and **`MODEL_REPO_ID`** empty so **FedAvg is skipped** and no Hub network calls are required. **`aggregator_client`** URL normalization is covered in `tests/test_aggregator_client.py`.
+
+### Run locally (same stack as the Space)
+
+```bash
+export NODE_SECRET="local_test_secret"
+# Optional: real FedAvg on Hub (otherwise merge is skipped when the third node submits)
+export HF_TOKEN=""
+export MODEL_REPO_ID=""
+
 pip install -r requirements.txt
 pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install "gradio==4.44.1"
 uvicorn app:app --host 0.0.0.0 --port 7860 --reload
 ```
 
+Open **`http://127.0.0.1:7860/`** for the Gradio dashboard. Smoke-test JSON endpoints:
+
+```bash
+BASE="http://127.0.0.1:7860"
+curl -sS "$BASE/health"
+curl -sS "$BASE/status"
+curl -sS -X POST "$BASE/submit" -H "Content-Type: application/json" \
+  -d "{\"node_id\":\"node_a\",\"secret_key\":\"local_test_secret\"}"
+```
+
+If the Space uses **`STATUS_READ_SECRET`**, mirror that locally:
+
+```bash
+curl -sS "$BASE/status" -H "X-Status-Secret: your-secret"
+```
+
 **Note:** `requirements.txt` caps **FastAPI** and **Starlette** below versions that ship **Starlette 1.x**. Gradio **4.44.x** is incompatible with that stack (the Space would return **500** on `GET /` with Jinja `unhashable type: 'dict'`). Upgrade Gradio before raising those caps.
+
+### Docker (parity with the HF Space)
+
+```bash
+docker build -t peft-aggregator .
+docker run --rm -p 7860:7860 \
+  -e NODE_SECRET="local_test_secret" \
+  -e HF_TOKEN="" \
+  -e MODEL_REPO_ID="" \
+  peft-aggregator
+```
+
+Then use the same **`curl`** examples with **`BASE=http://127.0.0.1:7860`**.
+
+### Test the deployed Hugging Face Space
+
+Use your Space **App** URL (hyphenated **`.hf.space`** host). Set **`BASE`** and **`SECRET`** to match **Repository secrets** on the Space.
+
+```bash
+BASE="https://YOUR_OWNER-YOUR_SPACE_NAME.hf.space"
+SECRET="your-node-secret-from-space-settings"
+
+curl -sS "$BASE/health"
+```
+
+**`GET /status`** — if **`STATUS_READ_SECRET`** is set on the Space, add the header; otherwise a public Space returns JSON without auth:
+
+```bash
+curl -sS "$BASE/status"
+# or: curl -sS "$BASE/status" -H "X-Status-Secret: $STATUS_READ_SECRET"
+```
+
+**`POST /submit`** — any node can submit independently; the first responses are **`"status":"submitted"`** with **`remaining`** until all three IDs have submitted for the current round. Omit **`round_num`** for a quick smoke test, or set **`round_num`** to the value returned by **`/status`** as **`current_round`** (mismatch → **409**).
+
+```bash
+for id in node_a node_b node_c; do
+  curl -sS -X POST "$BASE/submit" -H "Content-Type: application/json" \
+    -d "{\"node_id\":\"$id\",\"secret_key\":\"$SECRET\",\"avg_loss\":1.0,\"steps_completed\":10}"
+  echo
+done
+```
+
+After the third submit you should see **`"status":"round_complete"`** (with **`HF_TOKEN`/`MODEL_REPO_ID`** configured and valid adapter files on the Hub) or a message that merge was **skipped** / **`merge_failed`** if Hub setup is incomplete — both outcomes confirm the Space is running the aggregation logic.
+
+**`POST /reset`** — use **`ADMIN_SECRET`** if the Space defines it, else **`NODE_SECRET`**:
+
+```bash
+curl -sS -X POST "$BASE/reset" -H "Content-Type: application/json" \
+  -d "{\"secret_key\":\"$SECRET\"}"
+```
+
+**Python** — the same checks with **`aggregator_client`**:
+
+```python
+from aggregator_client import check_aggregator, health_aggregator, notify_aggregator
+
+BASE = "https://YOUR_OWNER-YOUR_SPACE_NAME.hf.space"
+SECRET = "your-node-secret"
+
+health_aggregator(BASE)
+check_aggregator(BASE, status_secret=None)  # or status_secret="..." if configured
+notify_aggregator(BASE, "node_a", SECRET, round_num=1)
+```
+
+**Private Space:** you may need to be logged into Hugging Face in a browser to open **`/`**; API calls from Colab or scripts still use **`NODE_SECRET`** on **`/submit`** and **`X-Status-Secret`** on **`/status`** when applicable — they do not use your HF login cookie.
 
 Deadline: April 20, 2026 · Lead target April 13

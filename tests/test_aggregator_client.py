@@ -12,6 +12,20 @@ def test_normalize_aggregator_base_url_adds_https():
     assert ac._normalize_aggregator_base_url("  example.hf.space/  ") == "https://example.hf.space"
 
 
+def test_normalize_aggregator_base_url_fixes_https_missing_slashes():
+    """https:host (typo) must not become https://https:host."""
+    assert ac._normalize_aggregator_base_url(
+        "https:instruction-fine-tuning-budget.hf.space"
+    ) == ("https://instruction-fine-tuning-budget.hf.space")
+    assert ac._normalize_aggregator_base_url(
+        "HTTPS:instruction-fine-tuning-budget.hf.space/"
+    ) == ("https://instruction-fine-tuning-budget.hf.space")
+
+
+def test_normalize_aggregator_base_url_fixes_http_missing_slashes():
+    assert ac._normalize_aggregator_base_url("http:127.0.0.1:7860") == "http://127.0.0.1:7860"
+
+
 def test_normalize_aggregator_base_url_preserves_explicit_scheme():
     assert ac._normalize_aggregator_base_url("http://127.0.0.1:7860") == "http://127.0.0.1:7860"
     assert ac._normalize_aggregator_base_url("https://x.hf.space/") == "https://x.hf.space"

@@ -6,6 +6,8 @@ Uses empty HF credentials so FedAvg skips Hub I/O (no network required).
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -35,6 +37,8 @@ def client(monkeypatch):
     app_module.state["last_update"] = None
     app_module.state["node_metrics"] = {}
     app_module.state["activity_log"] = []
+    app_module.state["merging"] = False
+    app_module.state["merge_error"] = None
 
     with TestClient(app_module.app) as c:
         yield c, app_module
@@ -148,6 +152,14 @@ def test_submit_unknown_node(client):
     assert r.status_code == 400
 
 
+def _wait_for_merge(app_module, timeout=5):
+    """Wait until the background merge thread completes."""
+    deadline = time.monotonic() + timeout
+    while app_module.state["merging"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not app_module.state["merging"], "merge did not complete in time"
+
+
 def test_full_round_merge_skipped_no_hf(client):
     tc, m = client
     secret = m.CONFIG["node_secret"]
@@ -168,9 +180,11 @@ def test_full_round_merge_skipped_no_hf(client):
         if nid != "node_c":
             assert body["status"] == "submitted"
         else:
-            assert body["status"] == "round_complete"
-            assert "Skipped merge" in body["merge_result"]
-            assert body["new_round"] == 2
+            # Last node triggers async merge — returns "merging"
+            assert body["status"] == "merging"
+
+    # Wait for the background merge thread to finish
+    _wait_for_merge(m)
 
     st = tc.get("/status").json()
     assert st["current_round"] == 2
@@ -268,6 +282,8 @@ def test_gradio_markdown_helpers_no_crash(client):
     secret = m.CONFIG["node_secret"]
     for nid in ("node_a", "node_b", "node_c"):
         tc.post("/submit", json={"node_id": nid, "secret_key": secret})
+
+    _wait_for_merge(m)
 
     m._loss_history_md()
     m._merged_adapters_md()

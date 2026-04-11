@@ -15,20 +15,63 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 
+def _detail_from_response(response: requests.Response) -> str:
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            d = data.get("detail")
+            if d is not None:
+                return str(d) if not isinstance(d, list) else str(d)
+    except Exception:
+        pass
+    text = (response.text or "").strip()
+    if text:
+        return text[:800]
+    return response.reason or ""
+
+
+def _raise_for_aggregator_response(response: requests.Response, *, what: str) -> None:
+    """Raise HTTPError with server ``detail`` and hints for common operator mistakes."""
+    if response.status_code < 400:
+        return
+    detail = _detail_from_response(response)
+    msg = f"{what}: HTTP {response.status_code}"
+    if detail:
+        msg += f" — {detail}"
+    if response.status_code == 401:
+        msg += (
+            ". Hint: POST /submit needs JSON ``secret_key`` equal to the Space "
+            "``NODE_SECRET``. GET /status needs header ``X-Status-Secret`` when the "
+            "Space sets ``STATUS_READ_SECRET`` — pass ``status_secret=...`` from "
+            "``poll_for_next_round`` / ``check_aggregator``, or set "
+            "``CONFIG['status_read_secret']`` in the notebook to match the Space."
+        )
+    raise requests.HTTPError(msg, response=response)
+
+
 def _normalize_aggregator_base_url(url: str) -> str:
     """Strip whitespace/slashes and ensure an HTTP(S) scheme for requests.
 
     Colab configs often omit ``https://``, which causes requests to raise
     ``MissingSchema``.
 
-    Also fixes a common mistake: pasting ``https://OWNER/SPACE.hf.space`` (slash)
-    instead of the real host ``https://OWNER-SPACE.hf.space``. Otherwise the HTTP
-    client treats ``OWNER`` as the hostname and fails DNS.
+    Also fixes: ``https:host`` (missing ``//`` after the scheme); pasting
+    ``https://OWNER/SPACE.hf.space`` (slash) instead of ``https://OWNER-SPACE.hf.space``
+    (otherwise the client treats ``OWNER`` as the hostname and DNS fails).
     """
     base = url.strip().rstrip("/")
     if not base:
         raise ValueError("aggregator_url is empty")
-    if "://" not in base:
+
+    low = base.lower()
+    # ``https:host`` / ``http:host`` (missing ``//``) does not contain ``://``;
+    # blindly prefixing ``https://`` would produce ``https://https:host`` and
+    # break urllib3 (InvalidURL).
+    if low.startswith("https:") and not low.startswith("https://"):
+        base = "https://" + base[6:].lstrip("/")
+    elif low.startswith("http:") and not low.startswith("http://"):
+        base = "http://" + base[5:].lstrip("/")
+    elif "://" not in base:
         base = "https://" + base.lstrip("/")
 
     parts = urlsplit(base)
@@ -109,7 +152,7 @@ def notify_aggregator(
             "(typically https://YOUR_SPACE_NAME.hf.space), not the huggingface.co/spaces "
             "HTML page URL. Path must be exactly /submit."
         )
-    response.raise_for_status()
+    _raise_for_aggregator_response(response, what="POST /submit")
     data = response.json()
     if data.get("status") == "merge_failed":
         raise AggregatorMergeFailed(data)
@@ -119,7 +162,7 @@ def notify_aggregator(
 def poll_for_next_round(
     aggregator_url: str,
     current_round: int,
-    poll_interval: int = 30,
+    poll_interval: int = 10,
     max_wait: int = 1800,
     status_secret: str | None = None,
 ) -> dict:
@@ -129,7 +172,7 @@ def poll_for_next_round(
         aggregator_url: Base URL of the aggregator Space (with or without
             ``https://``; missing scheme defaults to ``https://``).
         current_round: The round we just finished.
-        poll_interval: Seconds between status checks.
+        poll_interval: Seconds between status checks (default 10).
         max_wait: Maximum seconds to wait before raising TimeoutError.
         status_secret: If the Space sets STATUS_READ_SECRET, pass it here
             (sent as X-Status-Secret on GET /status).
@@ -139,6 +182,7 @@ def poll_for_next_round(
 
     Raises:
         TimeoutError: If max_wait is exceeded.
+        AggregatorMergeFailed: If the aggregator reports a merge error.
     """
     base = _normalize_aggregator_base_url(aggregator_url)
     url = f"{base}/status"
@@ -148,19 +192,32 @@ def poll_for_next_round(
     while elapsed < max_wait:
         try:
             resp = requests.get(url, timeout=15, headers=headers)
-            resp.raise_for_status()
+            _raise_for_aggregator_response(resp, what="GET /status")
             status = resp.json()
+
+            # Check for merge failure
+            merge_error = status.get("merge_error")
+            if merge_error:
+                raise AggregatorMergeFailed({"merge_result": merge_error})
+
             agg_round = status.get("current_round", 0)
             if agg_round > current_round:
                 print(f"[poll] Aggregator advanced to round {agg_round}")
                 return status
+
+            if status.get("merging"):
+                print(
+                    f"[poll] FedAvg merge in progress "
+                    f"({elapsed}/{max_wait}s elapsed)..."
+                )
+            else:
+                print(
+                    f"[poll] Waiting for round {current_round + 1} "
+                    f"({elapsed}/{max_wait}s elapsed)..."
+                )
         except requests.RequestException as e:
             print(f"[poll] Request error: {e}")
 
-        print(
-            f"[poll] Waiting for round {current_round + 1} "
-            f"({elapsed}/{max_wait}s elapsed)..."
-        )
         time.sleep(poll_interval)
         elapsed += poll_interval
 
@@ -183,7 +240,7 @@ def check_aggregator(
         timeout=timeout,
         headers=_status_headers(status_secret),
     )
-    response.raise_for_status()
+    _raise_for_aggregator_response(response, what="GET /status")
     return response.json()
 
 
@@ -199,7 +256,7 @@ def reset_aggregator(
         json={"secret_key": secret_key},
         timeout=timeout,
     )
-    response.raise_for_status()
+    _raise_for_aggregator_response(response, what="POST /reset")
     return response.json()
 
 
@@ -207,5 +264,5 @@ def health_aggregator(aggregator_url: str, timeout: int = 10) -> dict:
     """Liveness probe via GET /health; does not depend on training state."""
     url = f"{_normalize_aggregator_base_url(aggregator_url)}/health"
     response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
+    _raise_for_aggregator_response(response, what="GET /health")
     return response.json()
