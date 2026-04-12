@@ -231,6 +231,14 @@ def fedavg_merge() -> tuple[str, bool]:
     if not repo or not CONFIG["hf_token"]:
         return "Skipped merge — MODEL_REPO_ID or HF_TOKEN not set.", True
 
+    # Pin to the current HEAD revision so that later pushes (e.g. a node
+    # uploading next-round adapters) don't invalidate our downloads or
+    # cause cache misses mid-merge.
+    try:
+        revision = api.repo_info(repo_id=repo, token=CONFIG["hf_token"]).sha
+    except Exception:
+        revision = None  # fall back to default (main HEAD)
+
     adapter_states = []
     for node_id in CONFIG["expected_nodes"]:
         try:
@@ -238,6 +246,7 @@ def fedavg_merge() -> tuple[str, bool]:
                 repo_id=repo,
                 filename=f"{node_id}/adapter_model.safetensors",
                 token=CONFIG["hf_token"],
+                revision=revision,
             )
             adapter_states.append(load_file(path))
         except Exception as e:
