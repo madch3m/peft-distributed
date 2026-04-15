@@ -264,12 +264,47 @@ def fedavg_merge() -> tuple[str, bool]:
                 False,
             )
 
+    # Layer ownership: each node only trains its own layers. For parameters
+    # belonging to a specific layer, take from the owning node rather than
+    # averaging (other nodes' copies are untrained near-zero init values).
+    # For parameters that don't map to a numbered layer (e.g. lm_head),
+    # average across all nodes as before.
+    node_layer_ranges = {
+        "node_a": (0, 10),
+        "node_b": (11, 21),
+        "node_c": (22, 31),
+    }
+
+    def _owner_for_key(key: str) -> int | None:
+        """Return the index into expected_nodes of the node that owns this key,
+        or None if it should be averaged."""
+        # Extract layer number from parameter name (e.g. "...layers.5....")
+        layer_num = None
+        parts = key.split(".")
+        for part in parts:
+            if part.isdigit():
+                layer_num = int(part)
+                break
+        if layer_num is None:
+            return None
+        for idx, node_id in enumerate(CONFIG["expected_nodes"]):
+            lo, hi = node_layer_ranges.get(node_id, (-1, -1))
+            if lo <= layer_num <= hi:
+                return idx
+        return None
+
     merged_path = "/tmp/merged_adapter_model.safetensors"
     try:
         merged = {}
         for key in ref_keys:
-            stacked = [s[key].float() for s in adapter_states]
-            merged[key] = sum(stacked) / len(stacked)
+            owner_idx = _owner_for_key(key)
+            if owner_idx is not None:
+                # Take from the owning node — it's the only one that trained this layer
+                merged[key] = adapter_states[owner_idx][key].float()
+            else:
+                # No clear owner — average across all nodes
+                stacked = [s[key].float() for s in adapter_states]
+                merged[key] = sum(stacked) / len(stacked)
         save_file(merged, merged_path)
     except Exception as e:
         return f"FedAvg failed — tensor merge/save: {e}", False
