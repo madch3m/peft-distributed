@@ -350,6 +350,8 @@ def _background_merge(
     merge_round: int,
     round_metrics: dict,
     round_steps: dict,
+    round_eval_losses: dict,
+    round_perplexities: dict,
 ) -> None:
     """Run FedAvg in a background thread, then advance the round or record failure."""
     try:
@@ -365,6 +367,8 @@ def _background_merge(
                 "merge_result": merge_result,
                 "node_losses": round_metrics,
                 "node_steps": round_steps,
+                "node_eval_losses": round_eval_losses,
+                "node_perplexities": round_perplexities,
             })
             _log_activity(f"Round {merge_round} FedAvg complete")
             agg_log.info(
@@ -427,6 +431,8 @@ class SubmitRequest(BaseModel):
     round_num: int | None = None
     avg_loss: float | None = None
     steps_completed: int | None = None
+    eval_loss: float | None = None
+    perplexity: float | None = None
 
     @field_validator("avg_loss")
     @classmethod
@@ -541,6 +547,8 @@ def submit_node(req: SubmitRequest):
         state["node_metrics"][req.node_id] = {
             "avg_loss": req.avg_loss,
             "steps_completed": req.steps_completed,
+            "eval_loss": req.eval_loss,
+            "perplexity": req.perplexity,
             "round": state["current_round"],
             "submitted_at": _timestamp(),
         }
@@ -571,11 +579,19 @@ def submit_node(req: SubmitRequest):
                 nid: state["node_metrics"].get(nid, {}).get("steps_completed")
                 for nid in CONFIG["expected_nodes"]
             }
+            round_eval_losses = {
+                nid: state["node_metrics"].get(nid, {}).get("eval_loss")
+                for nid in CONFIG["expected_nodes"]
+            }
+            round_perplexities = {
+                nid: state["node_metrics"].get(nid, {}).get("perplexity")
+                for nid in CONFIG["expected_nodes"]
+            }
             merge_round = state["current_round"]
 
             thread = threading.Thread(
                 target=_background_merge,
-                args=(merge_round, round_metrics, round_steps),
+                args=(merge_round, round_metrics, round_steps, round_eval_losses, round_perplexities),
                 daemon=True,
             )
             thread.start()
@@ -662,6 +678,10 @@ def _node_cards_md():
 
         if metrics.get("avg_loss") is not None:
             lines.append(f"**Avg Loss:** {metrics['avg_loss']:.4f}")
+        if metrics.get("eval_loss") is not None: 
+            lines.append(f"**Eval Loss:** {metrics['eval_loss']:.4f}")
+        if metrics.get("perplexity") is not None:
+            lines.append(f"**Perplexity:** {metrics['perplexity']:.4f}") 
         if metrics.get("steps_completed") is not None:
             lines.append(f"**Steps:** {metrics['steps_completed']}")
         if metrics.get("submitted_at"):
