@@ -216,4 +216,81 @@ notify_aggregator(BASE, "node_a", SECRET, round_num=1)
 
 **Private Space:** you may need to be logged into Hugging Face in a browser to open **`/`**; API calls from Colab or scripts still use **`NODE_SECRET`** on **`/submit`** and **`X-Status-Secret`** on **`/status`** when applicable — they do not use your HF login cookie.
 
+## Loading the Fine-Tuned Model
+
+After training completes, the merged LoRA adapter for each round is stored on Hub at `merged/round_N/adapter_model.safetensors`. To load the model for inference:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
+from huggingface_hub import HfApi, hf_hub_download
+from safetensors.torch import load_file
+import torch
+import json
+
+REPO_ID = "Dev-the-dev91/instruction-fine-tuning-budget"
+HF_TOKEN = "hf_YOUR_TOKEN"
+BASE_MODEL = "microsoft/phi-2"
+
+# Find the latest merged round automatically
+api = HfApi(token=HF_TOKEN)
+state_path = hf_hub_download(repo_id=REPO_ID, filename="aggregator_state.json", token=HF_TOKEN)
+with open(state_path) as f:
+    state = json.load(f)
+latest_round = state["current_round"] - 1
+print(f"Latest merged round: {latest_round}")
+
+# Load base model
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True,
+    attn_implementation="sdpa",
+)
+
+# Attach LoRA with same config used during training
+lora_config = LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05,
+    target_modules=["q_proj", "v_proj", "k_proj", "dense", "fc1", "fc2"],
+    bias="none", task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, lora_config)
+
+# Download and apply the merged adapter
+merged_path = hf_hub_download(
+    repo_id=REPO_ID,
+    filename=f"merged/round_{latest_round}/adapter_model.safetensors",
+    token=HF_TOKEN,
+)
+merged_state = load_file(merged_path)
+model_params = dict(model.named_parameters())
+loaded = 0
+for key, tensor in merged_state.items():
+    if key in model_params:
+        model_params[key].data.copy_(tensor.to(model_params[key].device))
+        loaded += 1
+print(f"Loaded {loaded} adapter params from round {latest_round}")
+
+# Generate
+model.eval()
+prompt = "### Instruction:\nExplain photosynthesis in three sentences.\n\n### Response:\n"
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+with torch.no_grad():
+    output = model.generate(
+        **inputs,
+        max_new_tokens=200,
+        temperature=0.7,
+        top_p=0.9,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+print(tokenizer.decode(output[0], skip_special_tokens=True))
+```
+
+You can also load a specific round by setting `latest_round = N` instead of reading from `aggregator_state.json`.
+
 Deadline: April 20, 2026 · Lead target April 13

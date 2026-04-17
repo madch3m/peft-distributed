@@ -87,6 +87,7 @@ state = {
     "activity_log": [],       # recent events for the activity feed
     "merging": False,         # True while FedAvg is running in background
     "merge_error": None,      # set if background merge failed
+    "training_complete": False,  # set via dashboard toggle — blocks new submissions
 }
 
 _state_lock = threading.Lock()
@@ -107,6 +108,7 @@ def _persist_state_to_hub() -> None:
         "current_round": state["current_round"],
         "last_merged_round": state["current_round"] - 1,
         "history": state["history"],
+        "training_complete": state["training_complete"],
         "timestamp": _timestamp(),
     }
     path = "/tmp/aggregator_state.json"
@@ -155,6 +157,7 @@ def _restore_state_from_hub() -> None:
             state["node_metrics"] = {}
             state["merging"] = False
             state["merge_error"] = None
+            state["training_complete"] = saved.get("training_complete", False)
 
             _log_activity(f"State restored from Hub ({filename}) — resuming at round {restored_round}")
             agg_log.info(
@@ -470,11 +473,18 @@ def get_status(request: Request):
         "last_update": state["last_update"],
         "merging": state["merging"],
         "merge_error": state["merge_error"],
+        "training_complete": state["training_complete"],
     }
 
 
 @app.post("/submit")
 def submit_node(req: SubmitRequest):
+    if state["training_complete"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Training has been marked complete. No new submissions accepted.",
+        )
+
     if req.secret_key != CONFIG["node_secret"]:
         agg_log.warning("submit rejected: invalid secret node_id=%s", req.node_id)
         raise HTTPException(status_code=401, detail="Invalid secret key")
@@ -602,6 +612,7 @@ def reset_state(req: ResetRequest):
     state["activity_log"] = []
     state["merging"] = False
     state["merge_error"] = None
+    state["training_complete"] = False
 
     _log_activity("State reset to round 1")
     _persist_state_to_hub()
@@ -620,10 +631,15 @@ def _round_progress_md():
     pct = int((done / total) * 100) if total else 0
     bar = "█" * done + "░" * (total - done)
 
+    status_line = ""
+    if state["training_complete"]:
+        status_line = "\n\n**Status: TRAINING COMPLETE** — no new submissions accepted"
+
     return (
         f"## Round {state['current_round']}\n\n"
         f"**Progress:** {bar}  {done}/{total} nodes ({pct}%)\n\n"
         f"**Last update:** {state['last_update'] or 'Waiting for first submission'}"
+        f"{status_line}"
     )
 
 
@@ -814,7 +830,56 @@ with gr.Blocks(title="PEFT Aggregator", theme=gr.themes.Soft()) as demo:
         with gr.Column():
             activity_display = gr.Markdown(_activity_log_md)
 
-    refresh_btn = gr.Button("🔄 Refresh Dashboard", variant="primary")
+    with gr.Row():
+        refresh_btn = gr.Button("🔄 Refresh Dashboard", variant="primary")
+        training_complete_btn = gr.Button(
+            "Mark Training Complete",
+            variant="stop",
+        )
+        training_resume_btn = gr.Button(
+            "Resume Training",
+            variant="secondary",
+        )
+
+    training_status_display = gr.Markdown(
+        lambda: (
+            "**Training is COMPLETE** — submissions are blocked."
+            if state["training_complete"]
+            else "**Training is ACTIVE** — accepting submissions."
+        )
+    )
+
+    def _toggle_training_complete():
+        state["training_complete"] = True
+        _log_activity("Training marked as complete")
+        agg_log.info("training_complete=True")
+        _persist_state_to_hub()
+        return (
+            "**Training is COMPLETE** — submissions are blocked.",
+            _round_progress_md(),
+            _activity_log_md(),
+        )
+
+    def _toggle_training_resume():
+        state["training_complete"] = False
+        _log_activity("Training resumed")
+        agg_log.info("training_complete=False")
+        _persist_state_to_hub()
+        return (
+            "**Training is ACTIVE** — accepting submissions.",
+            _round_progress_md(),
+            _activity_log_md(),
+        )
+
+    training_complete_btn.click(
+        fn=_toggle_training_complete,
+        outputs=[training_status_display, progress_display, activity_display],
+    )
+    training_resume_btn.click(
+        fn=_toggle_training_resume,
+        outputs=[training_status_display, progress_display, activity_display],
+    )
+
     _dashboard_refresh = lambda: (
         _round_progress_md(),
         _node_cards_md(),
@@ -823,6 +888,9 @@ with gr.Blocks(title="PEFT Aggregator", theme=gr.themes.Soft()) as demo:
         _steps_bar_figure(),
         _merged_adapters_md(),
         _activity_log_md(),
+        "**Training is COMPLETE** — submissions are blocked."
+        if state["training_complete"]
+        else "**Training is ACTIVE** — accepting submissions.",
     )
     _dashboard_outputs = [
         progress_display,
@@ -832,6 +900,7 @@ with gr.Blocks(title="PEFT Aggregator", theme=gr.themes.Soft()) as demo:
         steps_plot,
         adapters_display,
         activity_display,
+        training_status_display,
     ]
 
     refresh_btn.click(fn=_dashboard_refresh, outputs=_dashboard_outputs)

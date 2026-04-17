@@ -41,6 +41,7 @@ def client(monkeypatch):
     app_module.state["activity_log"] = []
     app_module.state["merging"] = False
     app_module.state["merge_error"] = None
+    app_module.state["training_complete"] = False
 
     with TestClient(app_module.app) as c:
         yield c, app_module
