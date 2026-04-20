@@ -142,6 +142,11 @@ def notify_aggregator(
         payload["avg_loss"] = avg_loss
     if steps_completed is not None:
         payload["steps_completed"] = steps_completed
+    if eval_loss is not None:
+        payload["eval_loss"] = eval_loss
+    if perplexity is not None:
+        payload["perplexity"] = perplexity
+        
 
     base = _normalize_aggregator_base_url(aggregator_url)
     url = f"{base}/submit"
