@@ -111,6 +111,8 @@ def notify_aggregator(
     secret_key: str,
     round_num: int | None = None,
     avg_loss: float | None = None,
+    eval_loss: float | None = None,
+    perplexity: float | None = None,
     steps_completed: int | None = None,
     timeout: int = 30,
 ) -> dict:
@@ -123,6 +125,8 @@ def notify_aggregator(
         secret_key: Shared secret for authentication.
         round_num: Optional current round number for verification.
         avg_loss: Optional mean training loss for this round (shown on Space dashboard).
+        eval_loss: Optional evaluation loss on held-out data for this round.
+        perplexity: Optional perplexity metric for this round.
         steps_completed: Optional step count for this round (e.g. CONFIG steps_per_round).
         timeout: Request timeout in seconds.
 
@@ -146,7 +150,6 @@ def notify_aggregator(
         payload["eval_loss"] = eval_loss
     if perplexity is not None:
         payload["perplexity"] = perplexity
-        
 
     base = _normalize_aggregator_base_url(aggregator_url)
     url = f"{base}/submit"
