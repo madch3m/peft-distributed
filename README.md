@@ -69,6 +69,8 @@ notify_aggregator(
     round_num=1,
     avg_loss=0.42,           # optional: mean training loss for this round (dashboard table + charts)
     steps_completed=100,     # optional: steps trained this round (e.g. CONFIG["steps_per_round"])
+    eval_loss = 0.51        # optional: held-out evaluation loss
+    perplexity = 98.4,      # optional: perplexity (exp of eval_loss)
 )
 ```
 
@@ -86,7 +88,7 @@ For **local** runs, export `HF_TOKEN`, `MODEL_REPO_ID`, and `NODE_SECRET` (or re
 
 ## Operator notes
 
-- **Dashboard:** The Gradio UI shows per-node cards, a per-round loss table, **matplotlib** convergence and step-count plots, merged-adapter links, and an activity log. Use **Refresh** to update; metrics require nodes to POST **`avg_loss`** / **`steps_completed`** on **`/submit`** (see `notify_aggregator` keyword arguments above).
+- **Dashboard:** The Gradio UI shows per-node cards, a per-round loss table, **matplotlib** convergence and step-count plots, merged-adapter links, and an activity log. Use **Refresh** to update; metrics require nodes to POST **`avg_loss`** / **`steps_completed`** / **`eval_loss`** / **`perplexity`** on **`/submit`** (see `notify_aggregator` keyword arguments above).
 - **Secrets:** Never commit `HF_TOKEN`, `NODE_SECRET`, or tokens in git remotes. Use Space **Repository secrets** and a local env or credential helper.
 - **Reset:** `POST /reset` with JSON `{"secret_key": "<ADMIN_SECRET or NODE_SECRET>"}` clears round state to 1. If `ADMIN_SECRET` is set on the Space, use that; otherwise use `NODE_SECRET`.
 - **Protected status:** When `STATUS_READ_SECRET` is set, pass the same value as header `X-Status-Secret` (see `aggregator_client.check_aggregator` / `poll_for_next_round` argument `status_secret`, and notebook `CONFIG["status_read_secret"]`).
